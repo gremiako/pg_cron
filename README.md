@@ -1,4 +1,4 @@
-This fork support secondly granularity ,once time job, and is timezone-aware.
+up to 1.5, This fork support secondly granularity ,once time job, and is timezone-aware.
 
 [![Citus Banner](/github-banner.png)](https://www.citusdata.com/)
 
