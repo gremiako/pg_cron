@@ -55,28 +55,28 @@ free_entry(entry *e)
 static int
 getscheduletimenum(char *schedule)
 {
-    int num = 0;
+	int num = 0;
 
 	if (NULL == schedule || 0 == strlen(schedule))
 	{
-        elog(LOG, "invalid schedule");
-	    goto end;
+		elog(LOG, "invalid schedule");
+		goto end;
 	}
 
-    for (unsigned int i = 1; i <= strlen(schedule); i++)
-    {
-        if ((' ' == schedule[i]) && (' ' != schedule[i-1]))
-        {
-            num++;
-        }
-        if ((' ' != schedule[i]) && (strlen(schedule) == i))
-        {
-            num++;
-        }
-    }
+	for (unsigned int i = 1; i <= strlen(schedule); i++)
+	{
+		if ((' ' == schedule[i]) && (' ' != schedule[i-1]))
+		{
+			num++;
+		}
+		if ((' ' != schedule[i]) && (strlen(schedule) == i))
+		{
+			num++;
+		}
+	}
 
 end:
-    return num;
+	return num;
 }
 
 /* return NULL if eof or syntax error occurs;

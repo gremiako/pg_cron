@@ -1,11 +1,10 @@
 # src/test/modules/pg_cron/Makefile
 
 EXTENSION = pg_cron
+EXTVERSION = 1.4
 
 DATA_built = $(EXTENSION)--1.0.sql
 DATA = $(wildcard $(EXTENSION)--*--*.sql)
-
-REGRESS_OPTS =--temp-config=./pg_cron.conf --temp-instance=./tmp_check
 REGRESS = pg_cron-test 
 
 # compilation configuration
@@ -19,9 +18,16 @@ endif
 SHLIB_LINK = $(libpq)
 EXTRA_CLEAN += $(addprefix src/,*.gcno *.gcda) # clean up after profiling runs
 
-PG_CONFIG ?= pg_config
+ifdef USE_PGXS
+PG_CONFIG = lt_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+else
+subdir = contrib/pg_cron
+top_builddir = ../..
+include $(top_builddir)/src/Makefile.global
+include $(top_srcdir)/contrib/contrib-global.mk
+endif
 
 $(EXTENSION)--1.0.sql: $(EXTENSION).sql
 	cat $^ > $@

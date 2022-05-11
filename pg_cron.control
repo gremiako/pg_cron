@@ -1,4 +1,4 @@
-comment = 'Job scheduler for lightdb'
-default_version = '1.5'
+comment = 'Job scheduler for LightDB'
+default_version = '1.4'
 module_pathname = '$libdir/pg_cron'
 relocatable = false

@@ -12,6 +12,7 @@
  *-------------------------------------------------------------------------
  */
 #include <sys/resource.h>
+#include <unistd.h>
 
 #include "postgres.h"
 #include "fmgr.h"
@@ -36,14 +37,9 @@
 #include "task_states.h"
 #include "job_metadata.h"
 
-
-#ifdef HAVE_POLL_H
-#include <poll.h>
-#elif defined(HAVE_SYS_POLL_H)
-#include <sys/poll.h>
-#endif
-
+#include "poll.h"
 #include "sys/time.h"
+#include "sys/poll.h"
 #include "time.h"
 
 #include "access/genam.h"
@@ -130,7 +126,7 @@ static TimestampTz TimestampMinuteStart(TimestampTz time);
 static TimestampTz TimestampMinuteEnd(TimestampTz time);
 static bool ShouldRunTask(CronTask *task, entry *schedule, TimestampTz currentMinute,
 						  bool doWild, bool doNonWild);
-static bool isSetSecondCfg(entry *schedule);
+static bool isSecondSchedule(char *schedule);
 
 static void WaitForCronTasks(List *taskList);
 static void WaitForLatch(int timeoutMs);
@@ -140,12 +136,19 @@ static void ManageCronTasks(List *taskList, TimestampTz currentTime);
 static void ManageCronTask(CronTask *task, TimestampTz currentTime);
 static void ExecuteSqlString(const char *sql);
 static void GetTaskFeedback(PGresult *result, CronTask *task);
-static void GetBgwTaskFeedback(shm_mq_handle *responseq, CronTask *task, bool running);
+static void GetBgwTaskFeedback(shm_mq_handle *responseq, CronTask *task);
 
 static bool jobCanceled(CronTask *task);
 static bool jobStartupTimeout(CronTask *task, TimestampTz currentTime);
 static char* pg_cron_cmdTuples(char *msg);
 static void bgw_generate_returned_message(StringInfoData *display_msg, ErrorData edata);
+
+static void clearJobRunDetails(void);
+static bool cron_task_count_check_hook(int *newval, void **extra, GucSource source);
+static void cron_list_del(List *fixedTaskList, CronTask *task);
+static int queryTaskConnections(int64 jobId);
+static bool CronFixedStartTask(CronFixedTask *task);
+static bool jobRunningTimeout(CronTask *task, TimestampTz currentTime);
 
 /* global settings */
 char *CronTableDatabaseName = "postgres";
@@ -162,30 +165,15 @@ static const int MaxWait = 1000; /* maximum time in ms that poll() can block */
 static bool RebootJobsScheduled = false;
 static int RunningTaskCount = 0;
 static int MaxRunningTasks = 0;
-static int CronLogMinMessages = WARNING;
 static bool UseBackgroundWorkers = false;
 
-static const struct config_enum_entry cron_message_level_options[] = {
-	{"debug5", DEBUG5, false},
-	{"debug4", DEBUG4, false},
-	{"debug3", DEBUG3, false},
-	{"debug2", DEBUG2, false},
-	{"debug1", DEBUG1, false},
-	{"debug", DEBUG2, true},
-	{"info", INFO, false},
-	{"notice", NOTICE, false},
-	{"warning", WARNING, false},
-	{"error", ERROR, false},
-	{"log", LOG, false},
-	{"fatal", FATAL, false},
-	{"panic", PANIC, false},
-	{NULL, 0, false}
-};
-
-static const char *cron_error_severity(int elevel);
 static TimestampTz g_lastSecond = 0;
 static TimestampTz g_lastMinute = 0;
 static TimestampTz g_lastKeepRunDetailes = 0;
+
+static int MaxConnectPerTask = 0;
+static int MaxRunTaskTimeout = 0;
+
 
 /*
  * _PG_init gets called when the extension is loaded.
@@ -202,9 +190,10 @@ _PG_init(void)
 
 	if (!process_shared_preload_libraries_in_progress)
 	{
-		ereport(ERROR, (errmsg("pg_cron can only be loaded via shared_preload_libraries"),
-						errhint("Add pg_cron to the shared_preload_libraries "
-								"configuration variable in postgresql.conf.")));
+		//ereport(ERROR, (errmsg("pg_cron can only be loaded via shared_preload_libraries"),
+						//errhint("Add pg_cron to the shared_preload_libraries "
+								//"configuration variable in postgresql.conf.")));
+		return;
 	}
 
 	DefineCustomStringVariable(
@@ -237,16 +226,6 @@ _PG_init(void)
 		GUC_SUPERUSER_ONLY,
 		NULL, NULL, NULL);
 
-	DefineCustomBoolVariable(
-		"cron.enable_superuser_jobs",
-		gettext_noop("Allow jobs to be scheduled as superuser"),
-		NULL,
-		&EnableSuperuserJobs,
-		true,
-		PGC_USERSET,
-		GUC_SUPERUSER_ONLY,
-		NULL, NULL, NULL);
-
 	DefineCustomStringVariable(
 		"cron.host",
 		gettext_noop("Hostname to connect to postgres."),
@@ -273,9 +252,13 @@ _PG_init(void)
 			gettext_noop("Maximum number of jobs that can run concurrently."),
 			NULL,
 			&MaxRunningTasks,
-			(MaxConnections < 32) ? MaxConnections : 32,
+			32,
 			0,
+#ifdef USE_ASSERT_CHECKING
+			MaxConnections + 32,
+#else
 			MaxConnections,
+#endif
 			PGC_POSTMASTER,
 			GUC_SUPERUSER_ONLY,
 			NULL, NULL, NULL);
@@ -285,21 +268,39 @@ _PG_init(void)
 			gettext_noop("Maximum number of jobs that can run concurrently."),
 			NULL,
 			&MaxRunningTasks,
-			(max_worker_processes - 1 < 5) ? max_worker_processes - 1 : 5,
+			5,
 			0,
 			max_worker_processes - 1,
 			PGC_POSTMASTER,
 			GUC_SUPERUSER_ONLY,
 			NULL, NULL, NULL);
 
-	DefineCustomEnumVariable(
-		"cron.log_min_messages",
-		gettext_noop("log_min_messages for the launcher bgworker."),
+	/*
+	 * lightdb add 2022/3/16 for S202203046035
+	 */
+	DefineCustomIntVariable(
+		"cron.max_connections_per_task",
+		gettext_noop("Maximum number of connections that each task connection can run concurrently."),
 		NULL,
-		&CronLogMinMessages,
-		WARNING,
-		cron_message_level_options,
-		PGC_SIGHUP,
+		&MaxConnectPerTask,
+		(MaxConnections / MaxRunningTasks) < 4 ? (MaxConnections / MaxRunningTasks) : 4,
+		0,
+		MaxConnections / MaxRunningTasks,
+		PGC_POSTMASTER,
+		GUC_SUPERUSER_ONLY,
+		cron_task_count_check_hook, NULL, NULL);
+	/*
+	 * lightdb add 2022/4/2 for S202204026369
+	 */
+	DefineCustomIntVariable(
+		"cron.task_running_timeout",
+		gettext_noop("Maximum timeout of execution that each task can run."),
+		NULL,
+		&MaxRunTaskTimeout,
+		30,
+		0,
+		1800,
+		PGC_POSTMASTER,
 		GUC_SUPERUSER_ONLY,
 		NULL, NULL, NULL);
 
@@ -322,6 +323,25 @@ _PG_init(void)
 	RegisterBackgroundWorker(&worker);
 }
 
+static bool 
+cron_task_count_check_hook(int *newval, void **extra, GucSource source)
+{
+	int val = *newval;
+	int totalTaskConnect = MaxRunningTasks * val;
+
+	if (val > 16)
+	{
+		elog(ERROR, "the maximum value of cron.max_connections_per_task is 16");
+	}
+
+	if (totalTaskConnect > MaxConnections)
+	{
+		elog(ERROR, "the result of multiplying cron.max_running_jobs and cron.max_connections_per_task is out of range of max_connections");
+		elog(FATAL, "please consider reducing the value of either cron.max_running_jobs or cron.max_connections_per_task or both");
+	}
+
+	return true;
+}
 
 /*
  * Signal handler for SIGTERM
@@ -331,20 +351,19 @@ _PG_init(void)
 static void
 pg_cron_sigterm(SIGNAL_ARGS)
 {
-	int			save_errno = errno;
-
 	got_sigterm = true;
 
-	SetLatch(MyLatch);
+	if (MyProc != NULL)
+	{
+		SetLatch(&MyProc->procLatch);
+	}
 
 	if (!proc_exit_inprogress)
 	{
 		InterruptPending = true;
 		ProcDiePending = true;
 	}
-	
-	ProcessInterrupts();
-	errno = save_errno;
+	CHECK_FOR_INTERRUPTS();
 }
 
 
@@ -358,7 +377,10 @@ pg_cron_sighup(SIGNAL_ARGS)
 	CronJobCacheValid = false;
 	CronReloadConfig = true;
 
-	SetLatch(MyLatch);
+	if (MyProc != NULL)
+	{
+		SetLatch(&MyProc->procLatch);
+	}
 }
 
 /*
@@ -416,60 +438,6 @@ pg_cron_cmdTuples(char *msg)
 interpret_error:
 	ereport(LOG, (errmsg("could not interpret result from server: %s", msg)));
         return "";
-}
-
-/*
- * cron_error_severity --- get string representing elevel
- */
-static const char *
-cron_error_severity(int elevel)
-{
-	const char *elevel_char;
-
-	switch (elevel)
-	{
-		case DEBUG1:
-			elevel_char = "DEBUG1";
-			break;
-		case DEBUG2:
-			elevel_char = "DEBUG2";
-			break;
-		case DEBUG3:
-			elevel_char = "DEBUG3";
-			break;
-		case DEBUG4:
-			elevel_char = "DEBUG4";
-			break;
-		case DEBUG5:
-			elevel_char = "DEBUG5";
-			break;
-		case LOG:
-			elevel_char = "LOG";
-			break;
-		case INFO:
-			elevel_char = "INFO";
-			break;
-		case NOTICE:
-			elevel_char = "NOTICE";
-			break;
-		case WARNING:
-			elevel_char = "WARNING";
-			break;
-		case ERROR:
-			elevel_char = "ERROR";
-			break;
-		case FATAL:
-			elevel_char = "FATAL";
-			break;
-		case PANIC:
-			elevel_char = "PANIC";
-			break;
-		default:
-			elevel_char = "???";
-			break;
-	}
-
-	return elevel_char;
 }
 
 /*
@@ -550,7 +518,7 @@ pg_cron_background_worker_sigterm(SIGNAL_ARGS)
 		InterruptPending = true;
 		ProcDiePending = true;
 	}
-	ProcessInterrupts();
+
 	errno = save_errno;
 }
 
@@ -624,12 +592,9 @@ PgCronLauncherMain(Datum arg)
 											  ALLOCSET_DEFAULT_MAXSIZE);
 	InitializeJobMetadataCache();
 	InitializeTaskStateHash();
+	InitializeFixedTaskStateHash();
 
 	ereport(LOG, (errmsg("pg_cron scheduler started")));
-
-	/* set the desired log_min_messages */
-	SetConfigOption("log_min_messages", cron_error_severity(CronLogMinMessages),
-										PGC_POSTMASTER, PGC_S_OVERRIDE);
 
 	MemoryContextSwitchTo(CronLoopContext);
 
@@ -647,12 +612,12 @@ PgCronLauncherMain(Datum arg)
 
 		if (CronReloadConfig)
 		{
-			/* set the desired log_min_messages */
 			ProcessConfigFile(PGC_SIGHUP);
-			SetConfigOption("log_min_messages", cron_error_severity(CronLogMinMessages),
-												PGC_POSTMASTER, PGC_S_OVERRIDE);
+
 			CronReloadConfig = false;
 		}
+
+		clearJobRunDetails();
 
 		taskList = CurrentTaskList();
 		currentTime = GetCurrentTimestamp();
@@ -670,6 +635,26 @@ PgCronLauncherMain(Datum arg)
 	proc_exit(0);
 }
 
+/* 
+ * delete earliest data from cron.job_run_details where raw > 100000 every 10 seconds
+ * lightdb add 2022/3/24 for S202203046035
+*/
+static void 
+clearJobRunDetails(void)
+{
+	TimestampTz currentTime = GetCurrentTimestamp();
+
+	if (0 == g_lastKeepRunDetailes)
+	{
+		g_lastKeepRunDetailes = currentTime;
+	}
+
+	if (10000000 <= (currentTime - g_lastKeepRunDetailes))
+	{
+		keepDataFromCronRun();
+		g_lastKeepRunDetailes = currentTime;
+	}
+}
 
 /*
  * StartPendingRuns goes through the list of tasks and kicks of
@@ -688,7 +673,15 @@ StartAllPendingRuns(List *taskList, TimestampTz currentTime)
 		{
 			CronTask *task = (CronTask *) lfirst(taskCell);
 			CronJob *cronJob = GetCronJob(task->jobId);
-			entry *schedule = &cronJob->schedule;
+			entry *schedule = NULL;
+			if(cronJob)
+			{
+				schedule = &cronJob->schedule;
+			}
+			else
+			{
+				return;
+			}
 
 			if (schedule->flags & WHEN_REBOOT)
 			{
@@ -720,19 +713,6 @@ StartAllPendingRuns(List *taskList, TimestampTz currentTime)
 	 */
 	g_lastSecond = TimestampSecondStart(currentTime);
 	g_lastMinute = TimestampMinuteStart(currentTime);
-
-	/* delete earliest data from cron.job_run_details where raw > 100000 every 5 seconds
-	 */
-	if (0 == g_lastKeepRunDetailes)
-	{
-		g_lastKeepRunDetailes = currentTime;
-	}
-
-	if (10000000 <= (currentTime - g_lastKeepRunDetailes))
-	{
-		keepDataFromCronRun();
-		g_lastKeepRunDetailes = currentTime;
-	}
 }
 
 
@@ -744,15 +724,26 @@ static void
 StartPendingRuns(CronTask *task, TimestampTz currentTime)
 {
 	CronJob *cronJob = GetCronJob(task->jobId);
-	entry *schedule = &cronJob->schedule;
+	entry *schedule = NULL;
 	TimestampTz virtualTime;
 	TimestampTz currentTimeStart;
 	ClockProgress clockProgress;
 	int timestampTzMilli = 0;
 	int minutesPassed = 0;
 	int secondsPassed = 0;
+	bool is_second = false;
 
-	if (isSetSecondCfg(schedule))
+	if (cronJob)
+	{
+		is_second = isSecondSchedule(cronJob->scheduleText);
+		schedule = &cronJob->schedule;
+	}
+	else
+	{
+		return;
+	}
+	
+	if (is_second)
 	{
         /* second interval
         */
@@ -943,13 +934,13 @@ StartPendingRuns(CronTask *task, TimestampTz currentTime)
 static int
 SecondsPassed(TimestampTz startTime, TimestampTz stopTime)
 {
-    int microsPassed = 0;
-    long secondsPassed = 0;
+	int microsPassed = 0;
+	long secondsPassed = 0;
 
-    TimestampDifference(startTime, stopTime,
-                        &secondsPassed, &microsPassed);
+	TimestampDifference(startTime, stopTime,
+						&secondsPassed, &microsPassed);
 
-    return secondsPassed;
+	return secondsPassed;
 }
 
 /*
@@ -1027,27 +1018,39 @@ TimestampMinuteEnd(TimestampTz time)
 }
 
 /*
- * Determine whether the second parameter is configured
+ * check whether it is a second-level timing
  */
 static bool
-isSetSecondCfg(entry *schedule)
+isSecondSchedule(char *schedule)
 {
-    if (NULL == schedule)
-    {
-        return false;
-    }
+	int num = 0;
+	
+	if (NULL == schedule || 0 == strlen(schedule))
+	{
+		elog(LOG, "invalid schedule");
+		return false;
+	}
 
-    /* corresponding function set_element(), (59 >> 3) = 7
-     */
-    for (int i = 0; i <= 7; i++)
-    {
-        if (NULL != &(schedule->second[i]) && schedule->second[i])
-        {
-            return true;
-        }
-    }
+	for (unsigned int i = 1; i <= strlen(schedule); i++)
+	{
+		if ((' ' == schedule[i]) && (' ' != schedule[i-1]))
+		{
+			num++;
+		}
+		if ((' ' != schedule[i]) && (strlen(schedule) == i))
+		{
+			num++;
+		}
+	}
 
-    return false;
+	if (num > 5)
+	{
+		return true;
+	}
+	else
+	{
+		return false;
+	}
 }
 
 /*
@@ -1070,7 +1073,9 @@ ShouldRunTask(CronTask *task, entry *schedule, TimestampTz currentTime, bool doW
 	
 	int timecfg = 0;
 	int tmzone = 0;
-    TimestampTz tm_off = 0;
+	TimestampTz tm_off = 0;
+	bool is_second = false;
+	CronJob *cronJob = GetCronJob(task->jobId);
 
 	/* get time zone offset
 	*/
@@ -1087,29 +1092,61 @@ ShouldRunTask(CronTask *task, entry *schedule, TimestampTz currentTime, bool doW
 	month = tm->tm_mon +1 -FIRST_MONTH;
 	dayOfWeek = tm->tm_wday -FIRST_DOW;
 
+	if (cronJob)
+	{
+		is_second = isSecondSchedule(cronJob->scheduleText);
+	}
+	else
+	{
+		return false;
+	}
+	
 	/* if there is a second parameter, add the second detection
 	 */
-    if (isSetSecondCfg(schedule))
-    {
-        timecfg = bit_test(schedule->second, second) && bit_test(schedule->minute, minute) &&
-                  bit_test(schedule->hour, hour) && bit_test(schedule->month, month);
-    }
-    else
-    {
-        timecfg = bit_test(schedule->minute, minute) &&
-                  bit_test(schedule->hour, hour) && bit_test(schedule->month, month);
-    }
+	if (is_second)
+	{
+		timecfg = bit_test(schedule->second, second) && bit_test(schedule->minute, minute) &&
+					bit_test(schedule->hour, hour) && bit_test(schedule->month, month);
+	}
+	else
+	{
+		timecfg = bit_test(schedule->minute, minute) &&
+					bit_test(schedule->hour, hour) && bit_test(schedule->month, month);
+	}
 
 	if (timecfg &&
-	    ( ((schedule->flags & DOM_STAR) || (schedule->flags & DOW_STAR))
-	      ? (bit_test(schedule->dow,dayOfWeek) && bit_test(schedule->dom,dayOfMonth))
-	      : (bit_test(schedule->dow,dayOfWeek) || bit_test(schedule->dom,dayOfMonth)))) {
+		( ((schedule->flags & DOM_STAR) || (schedule->flags & DOW_STAR))
+		? (bit_test(schedule->dow,dayOfWeek) && bit_test(schedule->dom,dayOfMonth))
+		: (bit_test(schedule->dow,dayOfWeek) || bit_test(schedule->dom,dayOfMonth)))) {
 		if ((doNonWild && !(schedule->flags & (MIN_STAR|HR_STAR)))
-		    || (doWild && (schedule->flags & (MIN_STAR|HR_STAR))))
+			|| (doWild && (schedule->flags & (MIN_STAR|HR_STAR))))
 		{		
-			if (0 == task->pendingRunCount)
+			switch(task->mode)
 			{
-				return true;
+				case CRON_MODE_NEXT:
+				{
+					if (0 == task->pendingRunCount)
+					{
+						return true;
+					}	
+
+					break;
+				}
+
+				case CRON_MODE_FIXED:
+				{
+					if ((unsigned int)MaxConnectPerTask > task->pendingRunCount)
+					{
+						return true;
+					}
+
+					break;
+				}
+
+				default:
+				{
+					return true;
+				}
 			}
 		}
 	}
@@ -1185,11 +1222,14 @@ PollForTasks(List *taskList)
 	int taskCount = list_length(taskList);
 	int activeTaskCount = 0;
 	ListCell *taskCell = NULL;
+	int maxTaskConnectCnt = taskCount * MaxConnectPerTask;
+	List *fixedTaskList = NIL;
 
-	polledTasks = (CronTask **) palloc0(taskCount * sizeof(CronTask *));
-	pollFDs = (struct pollfd *) palloc0(taskCount * sizeof(struct pollfd));
+	polledTasks = (CronTask **) palloc0(maxTaskConnectCnt * sizeof(CronTask));
+	pollFDs = (struct pollfd *) palloc0(maxTaskConnectCnt * sizeof(struct pollfd));
 
 	currentTime = GetCurrentTimestamp();
+	fixedTaskList = CurrentFixedTaskList();
 
 	/*
 	 * At the latest, wake up when the next minute starts.
@@ -1199,85 +1239,190 @@ PollForTasks(List *taskList)
 	foreach(taskCell, taskList)
 	{
 		CronTask *task = (CronTask *) lfirst(taskCell);
-		PostgresPollingStatusType pollingStatus = task->pollingStatus;
-		struct pollfd *pollFileDescriptor = &pollFDs[activeTaskCount];
 
-		if (activeTaskCount >= MaxRunningTasks)
+		/* fixed interval mode cron task.
+		 * lightdb add 2022/3/21 for S202203046035
+		 */
+		if (CRON_MODE_FIXED == task->mode)
 		{
-			/* already polling the maximum number of tasks */
-			break;
-		}
+			ListCell* _cell = NULL;
 
-		if (task->state == CRON_TASK_ERROR || task->state == CRON_TASK_DONE ||
-			CanStartTask(task))
-		{
-			/* there is work to be done, don't wait */
-			pfree(polledTasks);
-			pfree(pollFDs);
-			return;
-		}
-
-		if (task->state == CRON_TASK_WAITING && task->pendingRunCount == 0)
-		{
-			/* don't poll idle tasks */
-			continue;
-		}
-
-		if (task->state == CRON_TASK_CONNECTING ||
-			task->state == CRON_TASK_SENDING)
-		{
-			/*
-			 * We need to wake up when a timeout expires.
-			 * Take the minimum of nextEventTime and task->startDeadline.
-			 */
-			if (TimestampDifferenceExceeds(task->startDeadline, nextEventTime, 0))
+			if (fixedTaskList)
 			{
-				nextEventTime = task->startDeadline;
+				foreach (_cell, fixedTaskList)
+				{
+					CronFixedTask* _curNode = (CronFixedTask *) lfirst(_cell);
+
+					if (_curNode)
+					{
+						if (task->jobId == _curNode->jobId)
+						{
+							PostgresPollingStatusType pollingStatus = _curNode->pollingStatus;
+							struct pollfd *pollFileDescriptor = &pollFDs[activeTaskCount];
+
+							if (activeTaskCount >= MaxRunningTasks)
+							{
+								/* already polling the maximum number of tasks */
+								break;
+							}
+
+							if (_curNode->state == CRON_TASK_ERROR || _curNode->state == CRON_TASK_DONE ||
+							CronFixedStartTask(_curNode))
+							{
+								/* there is work to be done, don't wait */
+								pfree(polledTasks);
+								pfree(pollFDs);
+								return;
+							}
+
+							if (_curNode->state == CRON_TASK_WAITING && _curNode->pendingRunCount == 0)
+							{
+								/* don't poll idle tasks */
+								continue;
+							}
+
+							if (_curNode->state == CRON_TASK_CONNECTING ||
+								_curNode->state == CRON_TASK_SENDING)
+							{
+								/*
+								 * We need to wake up when a timeout expires.
+								 * Take the minimum of nextEventTime and task->startDeadline.
+								 */
+								if (TimestampDifferenceExceeds(_curNode->startDeadline, nextEventTime, 0))
+								{
+									nextEventTime = _curNode->startDeadline;
+								}
+							}
+
+							/* we plan to poll this task */
+							pollFileDescriptor = &pollFDs[activeTaskCount];
+							polledTasks[activeTaskCount] = (CronTask *)_curNode;
+
+							if (_curNode->state == CRON_TASK_CONNECTING ||
+								_curNode->state == CRON_TASK_SENDING ||
+								_curNode->state == CRON_TASK_BGW_RUNNING ||
+								_curNode->state == CRON_TASK_RUNNING)
+							{
+								PGconn *connection = _curNode->connection;
+								int pollEventMask = 0;
+
+								/*
+								 * Set the appropriate mask for poll, based on the current polling
+								 * status of the task, controlled by ManageCronTask.
+								 */
+
+								if (pollingStatus == PGRES_POLLING_READING)
+								{
+									pollEventMask = POLLERR | POLLIN;
+								}
+								else if (pollingStatus == PGRES_POLLING_WRITING)
+								{
+									pollEventMask = POLLERR | POLLOUT;
+								}
+
+								pollFileDescriptor->fd = PQsocket(connection);
+								pollFileDescriptor->events = pollEventMask;
+							}
+							else
+							{
+								/*
+								 * Task is not running.
+								 */
+
+								pollFileDescriptor->fd = -1;
+								pollFileDescriptor->events = 0;
+							}
+
+							pollFileDescriptor->revents = 0;
+
+							activeTaskCount++;
+						}
+					}
+				}
 			}
-		}
-
-		/* we plan to poll this task */
-		pollFileDescriptor = &pollFDs[activeTaskCount];
-		polledTasks[activeTaskCount] = task;
-
-		if (task->state == CRON_TASK_CONNECTING ||
-			task->state == CRON_TASK_SENDING ||
-			task->state == CRON_TASK_BGW_RUNNING ||
-			task->state == CRON_TASK_RUNNING)
-		{
-			PGconn *connection = task->connection;
-			int pollEventMask = 0;
-
-			/*
-			 * Set the appropriate mask for poll, based on the current polling
-			 * status of the task, controlled by ManageCronTask.
-			 */
-
-			if (pollingStatus == PGRES_POLLING_READING)
-			{
-				pollEventMask = POLLERR | POLLIN;
-			}
-			else if (pollingStatus == PGRES_POLLING_WRITING)
-			{
-				pollEventMask = POLLERR | POLLOUT;
-			}
-
-			pollFileDescriptor->fd = PQsocket(connection);
-			pollFileDescriptor->events = pollEventMask;
 		}
 		else
 		{
-			/*
-			 * Task is not running.
-			 */
+			PostgresPollingStatusType pollingStatus = task->pollingStatus;
+			struct pollfd *pollFileDescriptor = &pollFDs[activeTaskCount];
 
-			pollFileDescriptor->fd = -1;
-			pollFileDescriptor->events = 0;
+			if (activeTaskCount >= MaxRunningTasks)
+			{
+				/* already polling the maximum number of tasks */
+				break;
+			}
+
+			if (task->state == CRON_TASK_ERROR || task->state == CRON_TASK_DONE ||
+				CanStartTask(task))
+			{
+				/* there is work to be done, don't wait */
+				pfree(polledTasks);
+				pfree(pollFDs);
+				return;
+			}
+
+			if (task->state == CRON_TASK_WAITING && task->pendingRunCount == 0)
+			{
+				/* don't poll idle tasks */
+				continue;
+			}
+
+			if (task->state == CRON_TASK_CONNECTING ||
+				task->state == CRON_TASK_SENDING)
+			{
+				/*
+				 * We need to wake up when a timeout expires.
+				 * Take the minimum of nextEventTime and task->startDeadline.
+				 */
+				if (TimestampDifferenceExceeds(task->startDeadline, nextEventTime, 0))
+				{
+					nextEventTime = task->startDeadline;
+				}
+			}
+
+			/* we plan to poll this task */
+			pollFileDescriptor = &pollFDs[activeTaskCount];
+			polledTasks[activeTaskCount] = task;
+
+			if (task->state == CRON_TASK_CONNECTING ||
+				task->state == CRON_TASK_SENDING ||
+				task->state == CRON_TASK_BGW_RUNNING ||
+				task->state == CRON_TASK_RUNNING)
+			{
+				PGconn *connection = task->connection;
+				int pollEventMask = 0;
+
+				/*
+				 * Set the appropriate mask for poll, based on the current polling
+				 * status of the task, controlled by ManageCronTask.
+				 */
+
+				if (pollingStatus == PGRES_POLLING_READING)
+				{
+					pollEventMask = POLLERR | POLLIN;
+				}
+				else if (pollingStatus == PGRES_POLLING_WRITING)
+				{
+					pollEventMask = POLLERR | POLLOUT;
+				}
+
+				pollFileDescriptor->fd = PQsocket(connection);
+				pollFileDescriptor->events = pollEventMask;
+			}
+			else
+			{
+				/*
+				 * Task is not running.
+				 */
+
+				pollFileDescriptor->fd = -1;
+				pollFileDescriptor->events = 0;
+			}
+
+			pollFileDescriptor->revents = 0;
+
+			activeTaskCount++;
 		}
-
-		pollFileDescriptor->revents = 0;
-
-		activeTaskCount++;
 	}
 
 	/*
@@ -1332,7 +1477,7 @@ PollForTasks(List *taskList)
 		struct pollfd *pollFileDescriptor = &pollFDs[taskIndex];
 
 		task->isSocketReady = pollFileDescriptor->revents &
-							  pollFileDescriptor->events;
+						  pollFileDescriptor->events;
 	}
 
 	pfree(polledTasks);
@@ -1348,12 +1493,78 @@ static bool
 CanStartTask(CronTask *task)
 {
 	return task->state == CRON_TASK_WAITING && task->pendingRunCount > 0 &&
-		   RunningTaskCount < MaxRunningTasks;
+		   RunningTaskCount < (MaxRunningTasks * MaxConnectPerTask);
 }
 
+/*
+ * CronFixedStartTask determines whether a task is ready to be started because
+ * it has pending runs and we are running less than MaxRunningTasks.
+ * lightdb add 2022/3/27 for S202203046035
+ */
+static bool
+CronFixedStartTask(CronFixedTask *task)
+{
+	return task->state == CRON_TASK_WAITING && task->pendingRunCount > 0 &&
+		   RunningTaskCount < (MaxRunningTasks * MaxConnectPerTask);
+}
 
 /*
- * ManageCronTasks proceeds the state machines of the given list of tasks.
+ * delete node from cron_task_list.
+ * lightdb add 2022/3/23 for S202203046035
+ */
+static void
+cron_list_del(List *fixedTaskList, CronTask *task)
+{
+	ListCell* _cell = NULL;
+	
+	if (fixedTaskList)
+	{
+		foreach (_cell, fixedTaskList)
+		{
+			CronFixedTask* _delNode = (CronFixedTask *) lfirst(_cell);
+			if (_delNode)
+			{
+				if (CRON_TASK_WAITING == _delNode->state && task->jobId == _delNode->jobId)
+				{
+					RemoveFixedTask(_delNode->runId);
+				}
+			}
+		}
+	}
+}
+
+/*
+ * query node count from cron_task_list.
+ * lightdb add 2022/3/23 for S202203046035
+ */
+static int
+queryTaskConnections(int64 jobId)
+{
+	List *fixedTaskList = NIL;
+	ListCell* _cell = NULL;
+	unsigned int connectTaskCount = 0;
+
+	fixedTaskList = CurrentFixedTaskList();
+	if (fixedTaskList)
+	{
+		foreach (_cell, fixedTaskList)
+		{
+			CronFixedTask* _curNode = (CronFixedTask *) lfirst(_cell);
+			if (_curNode)
+			{
+				if (jobId == _curNode->jobId)
+				{
+					connectTaskCount++;
+				}
+			}
+		}
+	}
+
+	return connectTaskCount;
+}
+
+/*
+ * ManageCronTasks proceeds the state machines of the given list of tasks.G
  */
 static void
 ManageCronTasks(List *taskList, TimestampTz currentTime)
@@ -1364,7 +1575,57 @@ ManageCronTasks(List *taskList, TimestampTz currentTime)
 	{
 		CronTask *task = (CronTask *) lfirst(taskCell);
 
-		ManageCronTask(task, currentTime);
+		/* fixed interval mode cron task.
+		 * lightdb add 2022/3/16 for S202203046035
+		 */
+		switch(task->mode)
+		{
+			case CRON_MODE_FIXED:
+			{
+				List *fixedTaskList = NIL;
+				ListCell *_cell = NULL;
+				unsigned int connectCount = queryTaskConnections(task->jobId);
+
+				if (task->isActive && connectCount < task->pendingRunCount && (unsigned int)MaxConnectPerTask > connectCount)
+				{
+					RefreshFixedTaskHash(task);
+				}
+
+				fixedTaskList = CurrentFixedTaskList();
+				if (fixedTaskList)
+				{
+					foreach (_cell, fixedTaskList)
+					{
+						CronFixedTask* _curNode = (CronFixedTask *) lfirst(_cell);
+						if (_curNode)
+						{
+							if (task->jobId == _curNode->jobId)
+							{
+								int offsetlen = sizeof(int64) * 2;
+								CronTask temp;
+								memset(&temp, 0, sizeof(CronTask));
+
+								_curNode->isActive = task->isActive;
+								temp.jobId = _curNode->jobId;
+								temp.runId = _curNode->runId;
+								memcpy((char*)&temp + offsetlen, (char*)_curNode + offsetlen, sizeof(CronTask) - offsetlen);
+								ManageCronTask(&temp, currentTime);
+								memcpy((char*)_curNode + offsetlen, (char*)&temp + offsetlen, sizeof(CronTask) - offsetlen);
+							}
+						}
+					}
+
+					cron_list_del(fixedTaskList, task);
+				}
+				
+				break;
+			}
+
+			default:
+			{
+				ManageCronTask(task, currentTime);
+			}	
+		}
 	}
 }
 
@@ -1381,6 +1642,11 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 	PGconn *connection = task->connection;
 	ConnStatusType connectionStatus = CONNECTION_BAD;
 	TimestampTz start_time;
+
+	if (!cronJob)
+	{
+		return;
+	}
 
 	switch (checkState)
 	{
@@ -1399,7 +1665,7 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 				break;
 			}
 
-			task->pendingRunCount -= 1;
+			//task->pendingRunCount -= 1;
 			if (UseBackgroundWorkers)
 				task->state = CRON_TASK_BGW_START;
 			else
@@ -1408,7 +1674,10 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 			RunningTaskCount++;
 
 			/* Add new entry to audit table. */
-			task->runId = NextRunId();
+			if (CRON_MODE_FIXED != task->mode)
+			{
+				task->runId = NextRunId();
+			}
 			if (CronLogRun)
 				InsertJobRunDetail(task->runId, &cronJob->jobId,
 										cronJob->database,
@@ -1449,13 +1718,13 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 
 				Assert(sizeof(keywordArray) == sizeof(valueArray));
 
-				if (CronLogStatement)
+				/*if (CronLogStatement)
 				{
 					char *command = cronJob->command;
 
 					ereport(LOG, (errmsg("cron job " INT64_FORMAT " %s: %s",
 									 jobId, GetCronStatus(CRON_STATUS_STARTING), command)));
-				}
+				}*/
 
 				connection = PQconnectStartParams(keywordArray, valueArray, false);
 				PQsetnonblocking(connection, 1);
@@ -1590,11 +1859,11 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 			/*
 			 * Start the worker process.
 			 */
-			if (CronLogStatement)
+			/*if (CronLogStatement)
 			{
 				ereport(LOG, (errmsg("cron job " INT64_FORMAT " %s: %s",
 										 jobId, GetCronStatus(CRON_STATUS_STARTING), command)));
-			}
+			}*/
 
 			/* If no no background worker slots are currently available
 			 * let's try until we reach jobStartupTimeout
@@ -1746,8 +2015,20 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 				/* wait for socket to be ready to receive results */
 				task->pollingStatus = PGRES_POLLING_READING;
 
-				/* command is underway, stop using timeout */
-				task->startDeadline = 0;
+				/*
+				 * set task execution timeout
+				 * lightdb add 2022/4/6 for S202204026369
+				 */
+				if (MaxRunTaskTimeout)
+				{
+					task->startDeadline = TimestampTzPlusMilliseconds(currentTime, (MaxRunTaskTimeout * 1000));
+				}
+				else
+				{
+					/* command is underway, stop using timeout */
+					task->startDeadline = 0;
+				}
+
 				task->state = CRON_TASK_RUNNING;
 
 				start_time = GetCurrentTimestamp();
@@ -1771,6 +2052,30 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 			/* check if job has been removed */
 			if (jobCanceled(task))
 				break;
+			/*
+			 * check if timeout has been reached 
+			 * lightdb add 2022/4/2 for S202204026369
+			 */
+			if (MaxRunTaskTimeout && jobRunningTimeout(task, currentTime))
+			{
+				if (connection)
+				{
+					char errbuf[256] = {0};
+					PGcancel *cancel = PQgetCancel(connection);
+
+					if (cancel)
+					{
+						if (1 != PQcancel(cancel, errbuf, 256))
+						{
+							task->errorMessage = errbuf;
+						}
+						
+						PQfreeCancel(cancel);
+					}
+				}
+				
+				break;
+			}
 
 			/* check if connection is still alive */
 			connectionStatus = PQstatus(connection);
@@ -1791,9 +2096,11 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 			PQconsumeInput(connection);
 
 			connectionBusy = PQisBusy(connection);
+
 			if (connectionBusy)
 			{
 				/* still waiting for results */
+				
 				break;
 			}
 
@@ -1833,6 +2140,10 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 				break;
 			}
 
+			/* still waiting for job to complete */
+			if (GetBackgroundWorkerPid(&task->handle, &pid) != BGWH_STOPPED)
+				break;
+
 			toc = shm_toc_attach(PG_CRON_MAGIC, dsm_segment_address(task->seg));
 			#if PG_VERSION_NUM < 100000
 				mq = shm_toc_lookup(toc, PG_CRON_KEY_QUEUE);
@@ -1840,16 +2151,7 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 				mq = shm_toc_lookup(toc, PG_CRON_KEY_QUEUE, false);
 			#endif
 			responseq = shm_mq_attach(mq, task->seg, NULL);
-
-			/* still waiting for job to complete */
-			if (GetBackgroundWorkerPid(&task->handle, &pid) != BGWH_STOPPED)
-			{
-				GetBgwTaskFeedback(responseq, task, true);
-				shm_mq_detach(responseq);
-				break;
-			}
-
-			GetBgwTaskFeedback(responseq, task, false);
+			GetBgwTaskFeedback(responseq, task);
 
 			task->state = CRON_TASK_DONE;
 			dsm_detach(task->seg);
@@ -1904,7 +2206,6 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 		default:
 		{
 			int currentPendingRunCount = task->pendingRunCount;
-			char mode[16] = {0};
 
 			InitializeCronTask(task, jobId);
 
@@ -1916,8 +2217,7 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 			task->pendingRunCount = currentPendingRunCount;
 			task->pendingRunCount -= 1;
 
-			queryModeFromCronExt(task->jobId, mode);
-			if (!strcmp(MODE_SINGLE, mode))
+			if (CRON_MODE_SINGLE == task->mode)
 			{
 				/* after one execution active: true -> false
 				 */
@@ -2007,13 +2307,13 @@ GetTaskFeedback(PGresult *result, CronTask *task)
 			if (CronLogRun)
 				UpdateJobRunDetail(task->runId, NULL, GetCronStatus(CRON_STATUS_SUCCEEDED), outputrows, NULL, &end_time);
 
-			if (CronLogStatement)
+			/*if (CronLogStatement)
 			{
 				ereport(LOG, (errmsg("cron job " INT64_FORMAT " completed: "
 									 "%d %s",
 									 task->jobId, tupleCount,
 									 rowString)));
-			}
+			}*/
 
 			break;
 		}
@@ -2024,7 +2324,7 @@ GetTaskFeedback(PGresult *result, CronTask *task)
 }
 
 static void
-GetBgwTaskFeedback(shm_mq_handle *responseq, CronTask *task, bool running)
+GetBgwTaskFeedback(shm_mq_handle *responseq, CronTask *task)
 {
 
 	TimestampTz end_time;
@@ -2071,10 +2371,9 @@ GetBgwTaskFeedback(shm_mq_handle *responseq, CronTask *task, bool running)
 
 						if (edata.elevel >= ERROR)
 							UpdateJobRunDetail(task->runId, NULL, GetCronStatus(CRON_STATUS_FAILED), display_msg.data, NULL, &end_time);
-						else if (running)
-							UpdateJobRunDetail(task->runId, NULL, NULL, display_msg.data, NULL, NULL);
 						else
 							UpdateJobRunDetail(task->runId, NULL, GetCronStatus(CRON_STATUS_SUCCEEDED), display_msg.data, NULL, &end_time);
+
 					}
 
 					ereport(LOG, (errmsg("cron job " INT64_FORMAT ": %s",
@@ -2197,6 +2496,7 @@ CronBackgroundWorker(Datum main_arg)
 	/* Post-execution cleanup. */
 	disable_timeout(STATEMENT_TIMEOUT, false);
 	CommitTransactionCommand();
+	ProcessCompletedNotifies();
 	pgstat_report_activity(STATE_IDLE, command);
 	pgstat_report_stat(true);
 
@@ -2433,4 +2733,27 @@ jobStartupTimeout(CronTask *task, TimestampTz currentTime)
     }
     else
         return false;
+}
+/*
+ * If a task has hit it's running deadline, set an appropriate error state on
+ * the task and return true. Note that this should only be called after a task
+ * has already been launched.
+ */
+static bool
+jobRunningTimeout(CronTask *task, TimestampTz currentTime)
+{
+	if (NULL == task)
+	{
+		return false;
+	}
+
+	if (TimestampDifferenceExceeds(task->startDeadline, currentTime, 0))
+	{
+		task->errorMessage = "job running timeout";
+		task->pollingStatus = 0;
+		task->state = CRON_TASK_ERROR;
+		return true;
+	}
+	else
+		return false;
 }

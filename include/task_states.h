@@ -33,6 +33,14 @@ typedef enum
 	CRON_TASK_BGW_RUNNING = 9
 } CronTaskState;
 
+typedef enum
+{
+	CRON_MODE_NEXT = 0,
+	CRON_MODE_ASAP = 1,
+	CRON_MODE_FIXED = 2,
+	CRON_MODE_SINGLE = 3
+} CronModeState;
+
 struct BackgroundWorkerHandle
 {
 	int slot;
@@ -54,8 +62,26 @@ typedef struct CronTask
 	bool freeErrorMessage;
 	dsm_segment *seg;
 	BackgroundWorkerHandle handle;
+	int mode;
 } CronTask;
 
+typedef struct CronFixedTask
+{
+	int64 runId;
+	int64 jobId;
+	CronTaskState state;
+	uint pendingRunCount;
+	PGconn *connection;
+	PostgresPollingStatusType pollingStatus;
+	TimestampTz startDeadline;
+	bool isSocketReady;
+	bool isActive;
+	char *errorMessage;
+	bool freeErrorMessage;
+	dsm_segment *seg;
+	BackgroundWorkerHandle handle;
+	int mode;
+} CronFixedTask;
 
 extern void InitializeTaskStateHash(void);
 extern void RefreshTaskHash(void);
@@ -63,5 +89,9 @@ extern List * CurrentTaskList(void);
 extern void InitializeCronTask(CronTask *task, int64 jobId);
 extern void RemoveTask(int64 jobId);
 
+extern void InitializeFixedTaskStateHash(void);
+extern void RefreshFixedTaskHash(CronTask *task);
+extern List * CurrentFixedTaskList(void);
+extern void RemoveFixedTask(int64 runId);
 
 #endif

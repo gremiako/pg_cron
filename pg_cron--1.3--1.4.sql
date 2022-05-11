@@ -1,44 +1,34 @@
 /* pg_cron--1.3--1.4.sql */
 
-/* cron_schedule_named expects job name to be text */
-DROP FUNCTION cron.schedule(name,text,text);
-CREATE FUNCTION cron.schedule(job_name text,
-                              schedule text,
-                              command text)
-RETURNS bigint
-LANGUAGE C
-AS 'MODULE_PATHNAME', $$cron_schedule_named$$;
-COMMENT ON FUNCTION cron.schedule(text,text,text)
-IS 'schedule a pg_cron job';
+CREATE TABLE cron.lt_job_ext (
+    jobid bigint,
+    jobname text,
+    username text,
+    mode text,
+    timezone text
+);
 
-CREATE FUNCTION cron.alter_job(job_id bigint,
-								schedule text default null,
-								command text default null,
-								database text default null,
-								username text default null,
-								active boolean default null)
-RETURNS void
-LANGUAGE C
-AS 'MODULE_PATHNAME', $$cron_alter_job$$;
+GRANT SELECT ON cron.lt_job_ext TO public;
+ALTER TABLE cron.lt_job_ext ENABLE ROW LEVEL SECURITY;
+CREATE POLICY lt_job_ext_policy ON cron.lt_job_ext USING (username = current_user);
 
-COMMENT ON FUNCTION cron.alter_job(bigint,text,text,text,text,boolean)
-IS 'Alter the job identified by job_id. Any option left as NULL will not be modified.';
+CREATE UNIQUE INDEX jobid_username_idx ON cron.lt_job_ext (jobid, username);
+ALTER TABLE cron.lt_job_ext ADD CONSTRAINT jobid_username_uniq UNIQUE USING INDEX jobid_username_idx;
 
-/* admin should decide whether alter_job is safe by explicitly granting execute */
-REVOKE ALL ON FUNCTION cron.alter_job(bigint,text,text,text,text,boolean) FROM public;
+CREATE VIEW cron.lt_job AS
+select cron.job.jobid, cron.job.jobname, command, schedule, nodename, nodeport, database, cron.job.username, active,
+       mode, timezone from cron.job, cron.lt_job_ext where cron.job.jobid = cron.lt_job_ext.jobid and cron.job.active = true;
 
-CREATE FUNCTION cron.schedule_in_database(job_name text,
-										  schedule text,
-										  command text,
-										  database text,
-										  username text default null,
-										  active boolean default 'true')
-RETURNS bigint
-LANGUAGE C
-AS 'MODULE_PATHNAME', $$cron_schedule_named$$;
+CREATE FUNCTION cron.schedule(job_name name, schedule text, command text, single_mode text)
+    RETURNS bigint
+    LANGUAGE C STRICT
+    AS 'MODULE_PATHNAME', $$cron_schedule_named_mode$$;
+COMMENT ON FUNCTION cron.schedule(name,text,text,text)
+    IS 'schedule a pg_cron job';
 
-COMMENT ON FUNCTION cron.schedule_in_database(text,text,text,text,text,boolean)
-IS 'schedule a pg_cron job';
-
-/* admin should decide whether cron.schedule_in_database is safe by explicitly granting execute */
-REVOKE ALL ON FUNCTION cron.schedule_in_database(text,text,text,text,text,boolean) FROM public;
+CREATE FUNCTION cron.schedule(job_name name, schedule text, command text, single_mode text, tmzone text)
+    RETURNS bigint
+    LANGUAGE C STRICT
+    AS 'MODULE_PATHNAME', $$cron_schedule_named_mode_zone$$;
+COMMENT ON FUNCTION cron.schedule(name,text,text,text,text)
+    IS 'schedule a pg_cron job';

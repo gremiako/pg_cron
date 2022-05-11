@@ -40,3 +40,4 @@ CREATE FUNCTION cron.unschedule(job_name name)
     AS 'MODULE_PATHNAME', $$cron_unschedule_named$$;
 COMMENT ON FUNCTION cron.unschedule(name)
     IS 'unschedule a pg_cron job';
+

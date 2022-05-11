@@ -44,11 +44,13 @@ typedef struct CronJob
 
 #define MODE_SINGLE 	"single"
 #define MODE_TIMING 	"timing"
+#define MODE_ASAP 		"asap"
+#define MODE_NEXT 		"next"
+#define MODE_FIXED 		"fixed"
 
 /* global settings */
 extern char *CronHost;
 extern bool CronJobCacheValid;
-extern bool EnableSuperuserJobs;
 
 
 /* functions for retrieving job metadata */

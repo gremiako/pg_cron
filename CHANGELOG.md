@@ -1,17 +1,3 @@
-### pg_cron v1.4.1 (September 25, 2021) ###
-
-* Fixes PostgreSQL 11- support
-
-### pg_cron v1.4.0 (September 16, 2021) ###
-
-* Adds a cron.alter_job function to change job properties, by Bertrand Drouvot
-* Adds a cron.schedule_in_database function to schedule in a custom database, by Bertrand Drouvot
-* Adds a cron.log_min_messages setting to control log_min_messages in pg_cron launcher, by Bertrand Drouvot
-* Adds a cron.enable_superuser_jobs setting to disallow superuser jobs
-* Fixes a bug that could cause jobs to hang when using cron.use_background_workers, by Bertrand Drouvot
-* Fixes a small memory allocation bug, by @mrdrivingduck
-* PostgreSQL 14 is supported (no changes were needed)
-
 ### pg_cron v1.3.1 (March 29, 2021) ###
 
 * Fixes a memory leak

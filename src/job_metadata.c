@@ -50,8 +50,6 @@
 
 #include "executor/spi.h"
 #include "catalog/pg_type.h"
-#include "commands/dbcommands.h"
-#include "catalog/pg_authid.h"
 
 #if (PG_VERSION_NUM < 120000)
 #define table_open(r, l) heap_open(r, l)
@@ -72,10 +70,7 @@
 /* forward declarations */
 static HTAB * CreateCronJobHash(void);
 
-
-static int64 ScheduleCronJob(text *scheduleText, text *commandText,
-								text *databaseText, text *usernameText,
-								bool active, text *jobnameText, char *mode, char *tmzone);
+static int64 ScheduleCronJob(Name jobName, char *schedule, char *command, char *mode, char *tmzone);
 static Oid CronExtensionOwner(void);
 static void EnsureDeletePermission(Relation cronJobsTable, HeapTuple heapTuple);
 static void InvalidateJobCacheCallback(Datum argument, Oid relationId);
@@ -85,12 +80,6 @@ static Oid CronJobRelationId(void);
 static CronJob * TupleToCronJob(TupleDesc tupleDescriptor, HeapTuple heapTuple);
 static bool PgCronHasBeenLoaded(void);
 static bool JobRunDetailsTableExists(void);
-static bool JobTableExists(void);
-
-static void AlterJob(int64 jobId, text *scheduleText, text *commandText,
-						text *databaseText, text *usernameText, bool *active);
-
-static Oid GetRoleOidIfCanLogin(char *username);
 
 static bool JobLtExtTableExists(void);
 static void insertCronExt(int64 jobid, char *jobname, char *mode, char *tmzone);
@@ -102,7 +91,6 @@ PG_FUNCTION_INFO_V1(cron_schedule_named);
 PG_FUNCTION_INFO_V1(cron_unschedule);
 PG_FUNCTION_INFO_V1(cron_unschedule_named);
 PG_FUNCTION_INFO_V1(cron_job_cache_invalidate);
-PG_FUNCTION_INFO_V1(cron_alter_job);
 PG_FUNCTION_INFO_V1(cron_schedule_named_mode);
 PG_FUNCTION_INFO_V1(cron_schedule_named_mode_zone);
 
@@ -113,7 +101,6 @@ static HTAB *CronJobHash = NULL;
 static Oid CachedCronJobRelationId = InvalidOid;
 bool CronJobCacheValid = false;
 char *CronHost = "localhost";
-bool EnableSuperuserJobs = true;
 
 
 /*
@@ -187,28 +174,100 @@ GetCronJob(int64 jobId)
 	return job;
 }
 
+
+/*
+ * cron_schedule schedules an unnamed cron job.
+ */
+Datum
+cron_schedule(PG_FUNCTION_ARGS)
+{
+	text *scheduleText = PG_GETARG_TEXT_P(0);
+	text *commandText = PG_GETARG_TEXT_P(1);
+
+	Name jobName = NULL;
+	char *schedule = text_to_cstring(scheduleText);
+	char *command = text_to_cstring(commandText);
+
+	int64 jobId = ScheduleCronJob(jobName, schedule, command, MODE_NEXT, DEFAULT_TIME_ZONE);
+
+	PG_RETURN_INT64(jobId);
+}
+
+
+/*
+ * cron_schedule_named schedules a named cron job
+ */
+Datum
+cron_schedule_named(PG_FUNCTION_ARGS)
+{
+	Name jobName = PG_GETARG_NAME(0);
+	text *scheduleText = PG_GETARG_TEXT_P(1);
+	text *commandText = PG_GETARG_TEXT_P(2);
+
+	char *schedule = text_to_cstring(scheduleText);
+	char *command = text_to_cstring(commandText);
+
+	int64 jobId = ScheduleCronJob(jobName, schedule, command, MODE_NEXT, DEFAULT_TIME_ZONE);
+
+	PG_RETURN_INT64(jobId);
+}
+
+/*
+ * cron_schedule_named_mode schedules a mode cron job
+ */
+Datum
+cron_schedule_named_mode(PG_FUNCTION_ARGS)
+{
+	Name jobName = PG_GETARG_NAME(0);
+	text *scheduleText = PG_GETARG_TEXT_P(1);
+	text *commandText = PG_GETARG_TEXT_P(2);
+	text *modeText = PG_GETARG_TEXT_P(3);
+
+	char *schedule = text_to_cstring(scheduleText);
+	char *command = text_to_cstring(commandText);
+	char *mode = text_to_cstring(modeText);
+
+	int64 jobId = ScheduleCronJob(jobName, schedule, command, mode, DEFAULT_TIME_ZONE);
+
+	PG_RETURN_INT64(jobId);
+}
+
+/*
+ * cron_schedule_named_mode_zone schedules a zone cron job
+ */
+Datum
+cron_schedule_named_mode_zone(PG_FUNCTION_ARGS)
+{
+	Name jobName = PG_GETARG_NAME(0);
+	text *scheduleText = PG_GETARG_TEXT_P(1);
+	text *commandText = PG_GETARG_TEXT_P(2);
+	text *modeText = PG_GETARG_TEXT_P(3);
+	text *zoneText = PG_GETARG_TEXT_P(4);
+
+	char *schedule = text_to_cstring(scheduleText);
+	char *command = text_to_cstring(commandText);
+	char *mode = text_to_cstring(modeText);
+	char *tmzone = text_to_cstring(zoneText);
+
+	int64 jobId = ScheduleCronJob(jobName, schedule, command, mode, tmzone);
+
+	PG_RETURN_INT64(jobId);
+}
+
 /*
  * ScheduleCronJob schedules a cron job with the given name/mode/zone.
  */
 static int64
-ScheduleCronJob(text *scheduleText, text *commandText, text *databaseText,
-					text *usernameText, bool active, text *jobnameText, char *mode, char *tmzone)
+ScheduleCronJob(Name jobName, char *schedule, char *command, char *mode, char *tmzone)
 {
 	entry *parsedSchedule = NULL;
-	char *schedule;
-	char *command;
-	char *database_name;
-	char *jobName = NULL;
-	char *username;
-	AclResult aclresult;
-	Oid userIdcheckacl;
 
 	int64 jobId = 0;
 	Datum jobIdDatum = 0;
 
 	StringInfoData querybuf;
-	Oid argTypes[8];
-	Datum argValues[8];
+	Oid argTypes[7];
+	Datum argValues[7];
 	int argCount = 0;
 
 	Oid savedUserId = InvalidOid;
@@ -219,13 +278,9 @@ ScheduleCronJob(text *scheduleText, text *commandText, text *databaseText,
 	bool returnedJobIdIsNull = false;
 
 	Oid userId = GetUserId();
-	userIdcheckacl = GetUserId();
-	username = GetUserNameFromId(userId, false);
+	char *userName = GetUserNameFromId(userId, false);
 
-	/* check schedule is valid */
-	schedule = text_to_cstring(scheduleText);
 	parsedSchedule = parse_cron_entry(schedule);
-
 	if (parsedSchedule == NULL)
 	{
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -234,7 +289,8 @@ ScheduleCronJob(text *scheduleText, text *commandText, text *databaseText,
 
 	free_entry(parsedSchedule);
 
-	if (strcmp(MODE_SINGLE, mode) && strcmp(MODE_TIMING, mode))
+	if (strcmp(MODE_SINGLE, mode) && strcmp(MODE_TIMING, mode) && strcmp(MODE_ASAP, mode)
+		 && strcmp(MODE_NEXT, mode) && strcmp(MODE_FIXED, mode))
 	{
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("invalid mode: %s", mode)));
@@ -250,19 +306,19 @@ ScheduleCronJob(text *scheduleText, text *commandText, text *databaseText,
 	initStringInfo(&querybuf);
 
 	appendStringInfo(&querybuf,
-		"insert into %s (schedule, command, nodename, nodeport, database, username, active",
+		"insert into %s (schedule, command, nodename, nodeport, database, username",
 		quote_qualified_identifier(CRON_SCHEMA_NAME, JOBS_TABLE_NAME));
 
-	if (jobnameText != NULL)
+	if (jobName != NULL)
 	{
 		appendStringInfo(&querybuf, ", jobname");
 	}
 
-	appendStringInfo(&querybuf, ") values ($1, $2, $3, $4, $5, $6, $7");
+	appendStringInfo(&querybuf, ") values ($1, $2, $3, $4, $5, $6");
 
-	if (jobnameText != NULL)
+	if (jobName != NULL)
 	{
-		appendStringInfo(&querybuf, ", $8) ");
+		appendStringInfo(&querybuf, ", $7) ");
 		appendStringInfo(&querybuf, "on conflict on constraint jobname_username_uniq ");
 		appendStringInfo(&querybuf, "do update set ");
 		appendStringInfo(&querybuf, "schedule = EXCLUDED.schedule, ");
@@ -280,7 +336,6 @@ ScheduleCronJob(text *scheduleText, text *commandText, text *databaseText,
 	argCount++;
 
 	argTypes[1] = TEXTOID;
-	command = text_to_cstring(commandText);
 	argValues[1] = CStringGetTextDatum(command);
 	argCount++;
 
@@ -292,57 +347,18 @@ ScheduleCronJob(text *scheduleText, text *commandText, text *databaseText,
 	argValues[3] = Int32GetDatum(PostPortNumber);
 	argCount++;
 
-	/* username has been provided */
-	if (usernameText != NULL)
-	{
-		if (!superuser())
-			elog(ERROR, "must be superuser to create a job for another role");
-
-		username = text_to_cstring(usernameText);
-		userIdcheckacl = GetRoleOidIfCanLogin(username);
-	}
-
-	/* database has been provided */
-	if (databaseText != NULL)
-		database_name = text_to_cstring(databaseText);
-	else
-	/* use the GUC */
-		database_name = CronTableDatabaseName;
-
-	/* first do a crude check to see whether superuser jobs are allowed */
-	if (!EnableSuperuserJobs && superuser_arg(userIdcheckacl))
-	{
-		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-						errmsg("cannot schedule jobs as superuser"),
-						errdetail("Scheduling jobs as superuser is disallowed when "
-								  "cron.enable_superuser_jobs is set to off.")));
-	}
-
-	/* ensure the user that is used in the job can connect to the database */
-	aclresult = pg_database_aclcheck(get_database_oid(database_name, false),
-										userIdcheckacl, ACL_CONNECT);
-
-	if (aclresult != ACLCHECK_OK)
-		elog(ERROR, "User %s does not have CONNECT privilege on %s",
-				GetUserNameFromId(userIdcheckacl, false), database_name);
-
 	argTypes[4] = TEXTOID;
-	argValues[4] = CStringGetTextDatum(database_name);
+	argValues[4] = CStringGetTextDatum(CronTableDatabaseName);
 	argCount++;
 
 	argTypes[5] = TEXTOID;
-	argValues[5] = CStringGetTextDatum(username);
+	argValues[5] = CStringGetTextDatum(userName);
 	argCount++;
 
-	argTypes[6] = BOOLOID;
-	argValues[6] = BoolGetDatum(active);
-	argCount++;
-
-	if (jobnameText != NULL)
+	if (jobName != NULL)
 	{
-		argTypes[7] = TEXTOID;
-		jobName = text_to_cstring(jobnameText);
-		argValues[7] = CStringGetTextDatum(jobName);
+		argTypes[6] = NAMEOID;
+		argValues[6] = NameGetDatum(jobName);
 		argCount++;
 	}
 
@@ -377,200 +393,15 @@ ScheduleCronJob(text *scheduleText, text *commandText, text *databaseText,
 
 	SPI_finish();
 
+	insertCronExt(jobId, (char *)jobName, mode, tmzone);
+
 	SetUserIdAndSecContext(savedUserId, savedSecurityContext);
 
 	InvalidateJobCache();
 
-	insertCronExt(jobId, (char *)jobName, mode, tmzone);
-
 	return jobId;
 }
 
-/*
- * GetRoleOidIfCanLogin
- * Checks user exist and can log in
- */
-static Oid
-GetRoleOidIfCanLogin(char *username)
-{
-	HeapTuple   roletup;
-	Form_pg_authid rform;
-	Oid roleOid = InvalidOid;
-
-	roletup = SearchSysCache1(AUTHNAME, PointerGetDatum(username));
-	if (!HeapTupleIsValid(roletup))
-		ereport(ERROR,
-				(errmsg("role \"%s\" does not exist",
-						username)));
-
-	rform = (Form_pg_authid) GETSTRUCT(roletup);
-
-	if (!rform->rolcanlogin)
-		ereport(ERROR,
-				(errmsg("role \"%s\" can not log in",
-						username),
-				 errdetail("Jobs may only be run by roles that have the LOGIN attribute.")));
-
-#if (PG_VERSION_NUM < 120000)
-	roleOid = HeapTupleGetOid(roletup);
-#else
-	roleOid = rform->oid;
-#endif
-
-	ReleaseSysCache(roletup);
-	return roleOid;
-}
-
-/*
- * cron_alter_job alter a job
- */
-Datum
-cron_alter_job(PG_FUNCTION_ARGS)
-{
-	int64 jobId;
-	text *scheduleText = NULL;
-	text *commandText = NULL;
-	text *databaseText = NULL;
-	text *usernameText = NULL;
-	bool active;
-
-	if (PG_ARGISNULL(0))
-		ereport(ERROR, (errmsg("job_id can not be NULL")));
-	else
-		jobId = PG_GETARG_INT64(0);
-
-	if (!PG_ARGISNULL(1))
-		scheduleText = PG_GETARG_TEXT_P(1);
-
-	if (!PG_ARGISNULL(2))
-		commandText = PG_GETARG_TEXT_P(2);
-
-	if (!PG_ARGISNULL(3))
-		databaseText = PG_GETARG_TEXT_P(3);
-
-	if (!PG_ARGISNULL(4))
-		usernameText = PG_GETARG_TEXT_P(4);
-
-	if (!PG_ARGISNULL(5))
-		active = PG_GETARG_BOOL(5);
-
-	AlterJob(jobId, scheduleText, commandText, databaseText, usernameText,
-				PG_ARGISNULL(5) ? NULL : &active);
-
-	PG_RETURN_VOID();
-}
-
-
-/*
- * cron_schedule schedule a job
- */
-Datum
-cron_schedule(PG_FUNCTION_ARGS)
-{
-	text *scheduleText = NULL;
-	text *commandText = NULL;
-	int64 jobId;
-
-	if (PG_ARGISNULL(0))
-		ereport(ERROR, (errmsg("schedule can not be NULL")));
-	else
-		scheduleText = PG_GETARG_TEXT_P(0);
-
-	if (PG_ARGISNULL(1))
-		ereport(ERROR, (errmsg("command can not be NULL")));
-	else
-		commandText = PG_GETARG_TEXT_P(1);
-
-	jobId = ScheduleCronJob(scheduleText, commandText, NULL,
-							NULL, true, NULL, MODE_TIMING, DEFAULT_TIME_ZONE);
-
-	PG_RETURN_INT64(jobId);
-}
-
-/*
- * cron_schedule schedule a named job
- */
-Datum
-cron_schedule_named(PG_FUNCTION_ARGS)
-{
-	text *scheduleText = NULL;
-	text *commandText = NULL;
-	text *databaseText = NULL;
-	text *usernameText = NULL;
-	bool active = true;
-	text *jobnameText = NULL;
-	int64 jobId;
-
-	if (PG_ARGISNULL(0))
-		ereport(ERROR, (errmsg("job_name can not be NULL")));
-	else
-		jobnameText = PG_GETARG_TEXT_P(0);
-
-	if (PG_ARGISNULL(1))
-		ereport(ERROR, (errmsg("schedule can not be NULL")));
-	else
-		scheduleText = PG_GETARG_TEXT_P(1);
-
-	if (PG_ARGISNULL(2))
-		ereport(ERROR, (errmsg("command can not be NULL")));
-	else
-		commandText = PG_GETARG_TEXT_P(2);
-
-	if (PG_NARGS() > 3)
-	{
-		if (!PG_ARGISNULL(3))
-			databaseText = PG_GETARG_TEXT_P(3);
-
-		if (!PG_ARGISNULL(4))
-			usernameText = PG_GETARG_TEXT_P(4);
-
-		if (!PG_ARGISNULL(5))
-			active = PG_GETARG_BOOL(5);
-	}
-
-	jobId = ScheduleCronJob(scheduleText, commandText, databaseText,
-							usernameText, active, jobnameText, MODE_TIMING, DEFAULT_TIME_ZONE);
-
-	PG_RETURN_INT64(jobId);
-}
-
-/*
- * cron_schedule_named_mode schedules a mode cron job
- */
-Datum
-cron_schedule_named_mode(PG_FUNCTION_ARGS)
-{
-	text *jobnameText = PG_GETARG_TEXT_P(0);
-	text *scheduleText = PG_GETARG_TEXT_P(1);
-	text *commandText = PG_GETARG_TEXT_P(2);
-	text *modeText = PG_GETARG_TEXT_P(3);
-
-	char *mode = text_to_cstring(modeText);
-
-	int64 jobId = ScheduleCronJob(scheduleText, commandText, NULL, NULL, true, jobnameText, mode, DEFAULT_TIME_ZONE);
-
-	PG_RETURN_INT64(jobId);
-}
-
-/*
- * cron_schedule_named_mode_zone schedules a zone cron job
- */
-Datum
-cron_schedule_named_mode_zone(PG_FUNCTION_ARGS)
-{
-	text *jobnameText = PG_GETARG_TEXT_P(0);
-	text *scheduleText = PG_GETARG_TEXT_P(1);
-	text *commandText = PG_GETARG_TEXT_P(2);
-	text *modeText = PG_GETARG_TEXT_P(3);
-	text *zoneText = PG_GETARG_TEXT_P(4);
-
-	char *mode = text_to_cstring(modeText);
-	char *tmzone = text_to_cstring(zoneText);
-
-	int64 jobId = ScheduleCronJob(scheduleText, commandText, NULL, NULL, true, jobnameText, mode, tmzone);
-
-	PG_RETURN_INT64(jobId);
-}
 
 /*
  * NextRunId draws a new run ID from cron.runid_seq.
@@ -712,10 +543,10 @@ cron_unschedule(PG_FUNCTION_ARGS)
 	systable_endscan(scanDescriptor);
 	table_close(cronJobsTable, NoLock);
 
+	deleteCronExt(jobId, NULL);
+
 	CommandCounterIncrement();
 	InvalidateJobCache();
-
-    deleteCronExt(jobId, NULL);
 
 	PG_RETURN_BOOL(true);
 }
@@ -765,10 +596,10 @@ cron_unschedule_named(PG_FUNCTION_ARGS)
 	systable_endscan(scanDescriptor);
 	table_close(cronJobsTable, NoLock);
 
+	deleteCronExt(0, (char *)jobName);
+
 	CommandCounterIncrement();
 	InvalidateJobCache();
-
-    deleteCronExt(0, (char *)jobName);
 
 	PG_RETURN_BOOL(true);
 }
@@ -929,29 +760,11 @@ LoadCronJobList(void)
 	{
 		MemoryContext oldContext = NULL;
 		CronJob *job = NULL;
-		Oid jobOwnerId = InvalidOid;
 
 		oldContext = MemoryContextSwitchTo(CronJobContext);
 
 		job = TupleToCronJob(tupleDescriptor, heapTuple);
-
-		jobOwnerId = get_role_oid(job->userName, false);
-		if (!EnableSuperuserJobs && superuser_arg(jobOwnerId))
-		{
-			/*
-			 * Someone inserted a superuser into the metadata. Skip over the
-			 * job when cron.enable_superuser_jobs is disabled. The memory
-			 * will be cleaned up when CronJobContext is reset.
-			 */
-			ereport(WARNING, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-							  errmsg("skipping job " INT64_FORMAT " since superuser jobs "
-									 "are currently disallowed",
-									 job->jobId)));
-		}
-		else
-		{
-			jobList = lappend(jobList, job);
-		}
+		jobList = lappend(jobList, job);
 
 		MemoryContextSwitchTo(oldContext);
 
@@ -1268,171 +1081,6 @@ UpdateJobRunDetail(int64 runId, int32 *job_pid, char *status, char *return_messa
 	pgstat_report_activity(STATE_IDLE, NULL);
 }
 
-
-static void
-AlterJob(int64 jobId, text *scheduleText, text *commandText, text *databaseText, text *usernameText, bool *active)
-{
-	StringInfoData querybuf;
-	Oid argTypes[7];
-	Datum argValues[7];
-	int i;
-	AclResult aclresult;
-	Oid userId;
-	Oid userIdcheckacl;
-	Oid savedUserId;
-	int savedSecurityContext;
-	char *database_name;
-	char *schedule;
-	char *command;
-	char *username;
-	char *currentuser;
-	entry *parsedSchedule = NULL;
-
-	userId = GetUserId();
-	userIdcheckacl = GetUserId();
-
-	currentuser = GetUserNameFromId(userId, false);
-	savedUserId = InvalidOid;
-	savedSecurityContext = 0;
-
-	if (!PgCronHasBeenLoaded() || RecoveryInProgress() || !JobTableExists())
-	{
-		return;
-	}
-
-	initStringInfo(&querybuf);
-	i = 0;
-
-	appendStringInfo(&querybuf,
-		"update %s.%s set", CRON_SCHEMA_NAME, JOBS_TABLE_NAME);
-
-	/* username has been provided */
-	if (usernameText != NULL)
-	{
-		if (!superuser())
-			elog(ERROR, "must be superuser to alter username");
-
-		username = text_to_cstring(usernameText);
-		userIdcheckacl = GetRoleOidIfCanLogin(username);
-	}
-	else
-	{
-		username = currentuser;
-	}
-
-	if (!EnableSuperuserJobs && superuser_arg(userIdcheckacl))
-	{
-		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-						errmsg("cannot schedule jobs as superuser"),
-						errdetail("Scheduling jobs as superuser is disallowed when "
-								  "cron.enable_superuser_jobs is set to off.")));
-	}
-
-	/* add the fields to be updated */
-	/* database has been provided */
-	if (databaseText != NULL)
-	{
-		database_name = text_to_cstring(databaseText);
-		/* ensure the user that is used in the job can connect to the database */
-		aclresult = pg_database_aclcheck(get_database_oid(database_name, false), userIdcheckacl, ACL_CONNECT);
-
-		if (aclresult != ACLCHECK_OK)
-			elog(ERROR, "User %s does not have CONNECT privilege on %s", GetUserNameFromId(userIdcheckacl, false), database_name);
-
-		argTypes[i] = TEXTOID;
-		argValues[i] = CStringGetTextDatum(database_name);
-		i++;
-		appendStringInfo(&querybuf, " database = $%d,", i);
-	}
-
-	/* ensure schedule is valid */
-	if (scheduleText != NULL)
-	{
-		schedule = text_to_cstring(scheduleText);
-		parsedSchedule = parse_cron_entry(schedule);
-
-		if (parsedSchedule == NULL)
-		{
-			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					errmsg("invalid schedule: %s", schedule)));
-		}
-
-		free_entry(parsedSchedule);
-
-		argTypes[i] = TEXTOID;
-		argValues[i] = CStringGetTextDatum(schedule);
-		i++;
-		appendStringInfo(&querybuf, " schedule = $%d,", i);
-	}
-
-	if (commandText != NULL)
-	{
-		argTypes[i] = TEXTOID;
-		command = text_to_cstring(commandText);
-		argValues[i] = CStringGetTextDatum(command);
-		i++;
-		appendStringInfo(&querybuf, " command = $%d,", i);
-	}
-
-	if (usernameText != NULL)
-	{
-		argTypes[i] = TEXTOID;
-		argValues[i] = CStringGetTextDatum(username);
-		i++;
-		appendStringInfo(&querybuf, " username = $%d,", i);
-	}
-
-	if (active != NULL)
-	{
-		argTypes[i] = BOOLOID;
-		argValues[i] = BoolGetDatum(*active);
-		i++;
-		appendStringInfo(&querybuf, " active = $%d,", i);
-	}
-
-	/* remove the last comma */
-	querybuf.len--;
-	querybuf.data[querybuf.len] = '\0';
-
-	/* and add the where clause */
-	argTypes[i] = INT8OID;
-	argValues[i] = Int64GetDatum(jobId);
-	i++;
-
-	appendStringInfo(&querybuf, " where jobid = $%d", i);
-
-	/* ensure the caller owns the row */
-	argTypes[i] = TEXTOID;
-	argValues[i] = CStringGetTextDatum(currentuser);
-	i++;
-
-	if (!superuser())
-		appendStringInfo(&querybuf, " and username = $%d", i);
-
-	if (i <= 2)
-		ereport(ERROR, (errmsg("no updates specified"),
-						errhint("You must specify at least one job attribute to change when calling alter_job")));
-
-	GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
-	SetUserIdAndSecContext(CronExtensionOwner(), SECURITY_LOCAL_USERID_CHANGE);
-
-	/* Open SPI context. */
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "SPI_connect failed");
-	if(SPI_execute_with_args(querybuf.data,
-		i, argTypes, argValues, NULL, false, 1) != SPI_OK_UPDATE)
-		elog(ERROR, "SPI_exec failed: %s", querybuf.data);
-
-	pfree(querybuf.data);
-
-	if (SPI_processed <= 0)
-		elog(ERROR, "Job " INT64_FORMAT " does not exist or you don't own it", jobId);
-
-	SPI_finish();
-	SetUserIdAndSecContext(savedUserId, savedSecurityContext);
-	InvalidateJobCache();
-}
-
 void
 MarkPendingRunsAsFailed(void)
 {
@@ -1523,29 +1171,16 @@ JobRunDetailsTableExists(void)
 }
 
 /*
- * JobTableExists returns whether the job table exists.
- */
-static bool
-JobTableExists(void)
-{
-	Oid cronSchemaId = get_namespace_oid(CRON_SCHEMA_NAME, false);
-	Oid jobTableOid = get_relname_relid(JOBS_TABLE_NAME,
-										cronSchemaId);
-
-	return jobTableOid != InvalidOid;
-}
-
-/*
  * JobLtExtTableExists returns whether the lt_job_ext table exists.
  */
 static bool
 JobLtExtTableExists(void)
 {
-    Oid cronSchemaId = get_namespace_oid(CRON_SCHEMA_NAME, false);
-    Oid jobLtExtTableOid = get_relname_relid(LT_JOB_EXT,
-                                                  cronSchemaId);
+	Oid cronSchemaId = get_namespace_oid(CRON_SCHEMA_NAME, false);
+	Oid jobLtExtTableOid = get_relname_relid(LT_JOB_EXT,
+											cronSchemaId);
 
-    return jobLtExtTableOid != InvalidOid;
+	return jobLtExtTableOid != InvalidOid;
 }
 
 /*
@@ -1554,8 +1189,10 @@ JobLtExtTableExists(void)
 static void
 insertCronExt(int64 jobid, char *jobname, char *mode, char *tmzone)
 {
-    char updatebuf[1024] = {0};
-    Oid userId = GetUserId();
+	char updatebuf[1024] = {0};
+	Oid savedUserId = InvalidOid;
+	int savedSecurityContext = 0;
+	Oid userId = GetUserId();
 	char *userName = GetUserNameFromId(userId, false);
 
 	if(!JobLtExtTableExists())
@@ -1563,35 +1200,41 @@ insertCronExt(int64 jobid, char *jobname, char *mode, char *tmzone)
 		return;
 	}
 
-    /* Open SPI context. */
-    if (SPI_connect() != SPI_OK_CONNECT)
-    {
-        elog(ERROR, "SPI_connect failed");
-    }
+	/* Open SPI context. */
+	if (SPI_connect() != SPI_OK_CONNECT)
+	{
+		elog(ERROR, "SPI_connect failed");
+	}
 
 	if (NULL == jobname)
-    {
-        snprintf(updatebuf, 1024,
-         "insert into %s (jobid, username, mode, timezone) values (%lld, '%s', '%s', %s) on conflict on constraint jobid_username_uniq do update set mode = EXCLUDED.mode, timezone = EXCLUDED.timezone",
-         quote_qualified_identifier(CRON_SCHEMA_NAME, LT_JOB_EXT), (long long int)jobid, userName, mode, tmzone);
-    }
+	{
+		snprintf(updatebuf, 1024,
+			"insert into %s (jobid, username, mode, timezone) values (%lld, '%s', '%s', %s) on conflict on constraint jobid_username_uniq do update set mode = EXCLUDED.mode, timezone = EXCLUDED.timezone",
+			quote_qualified_identifier(CRON_SCHEMA_NAME, LT_JOB_EXT), (long long int)jobid, userName, mode, tmzone);
+	}
 	else
 	{
 		snprintf(updatebuf, 1024,
-         "insert into %s (jobid, jobname, username, mode, timezone) values (%lld, '%s', '%s', '%s', %s) on conflict on constraint jobid_username_uniq do update set mode = EXCLUDED.mode, timezone = EXCLUDED.timezone",
-         quote_qualified_identifier(CRON_SCHEMA_NAME, LT_JOB_EXT), (long long int)jobid, jobname, userName, mode, tmzone);
+			"insert into %s (jobid, jobname, username, mode, timezone) values (%lld, '%s', '%s', '%s', %s) on conflict on constraint jobid_username_uniq do update set mode = EXCLUDED.mode, timezone = EXCLUDED.timezone",
+			quote_qualified_identifier(CRON_SCHEMA_NAME, LT_JOB_EXT), (long long int)jobid, jobname, userName, mode, tmzone);
 	}
 
-    SPI_execute(updatebuf, false, 0);
+	GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
+	SetUserIdAndSecContext(CronExtensionOwner(), SECURITY_LOCAL_USERID_CHANGE);
 
-    memset(updatebuf, 0, 1024);
-    snprintf(updatebuf, 1024,
-             "update %s set active = 'true' where jobid = %lld",
-             quote_qualified_identifier(CRON_SCHEMA_NAME, JOBS_TABLE_NAME), (long long int)jobid);
+	SPI_execute(updatebuf, false, 0);
 
-    SPI_execute(updatebuf, false, 0);
+	memset(updatebuf, 0, 1024);
+	snprintf(updatebuf, 1024,
+		"update %s set active = 'true' where jobid = %lld",
+		quote_qualified_identifier(CRON_SCHEMA_NAME, JOBS_TABLE_NAME), (long long int)jobid);
 
-    SPI_finish();
+	SPI_execute(updatebuf, false, 0);
+
+	SPI_finish();
+
+	SetUserIdAndSecContext(savedUserId, savedSecurityContext);
+	InvalidateJobCache();
 }
 
 /*
@@ -1600,35 +1243,43 @@ insertCronExt(int64 jobid, char *jobname, char *mode, char *tmzone)
 static void
 deleteCronExt(int64 jobid, char *jobname)
 {
-    char deletebuf[1024] = {0};
+	char deletebuf[1024] = {0};
+	Oid savedUserId = InvalidOid;
+	int savedSecurityContext = 0;
 
 	if(!JobLtExtTableExists())
 	{
 		return;
 	}
 
-    if (NULL != jobname)
-    {
-        snprintf(deletebuf, 1024,
-             "delete from %s where jobname = '%s'",
-             quote_qualified_identifier(CRON_SCHEMA_NAME, LT_JOB_EXT), jobname);
-    }
-    else
-    {
-        snprintf(deletebuf, 1024,
-             "delete from %s where jobid = %lld",
-             quote_qualified_identifier(CRON_SCHEMA_NAME, LT_JOB_EXT), (long long int)jobid);
-    }
+	if (NULL != jobname)
+	{
+		snprintf(deletebuf, 1024,
+			"delete from %s where jobname = '%s'",
+			quote_qualified_identifier(CRON_SCHEMA_NAME, LT_JOB_EXT), jobname);
+	}
+	else
+	{
+		snprintf(deletebuf, 1024,
+			"delete from %s where jobid = %lld",
+			quote_qualified_identifier(CRON_SCHEMA_NAME, LT_JOB_EXT), (long long int)jobid);
+	}
 
-    /* Open SPI context. */
-    if (SPI_connect() != SPI_OK_CONNECT)
-    {
-        elog(ERROR, "SPI_connect failed");
-    }
+	/* Open SPI context. */
+	if (SPI_connect() != SPI_OK_CONNECT)
+	{
+		elog(ERROR, "SPI_connect failed");
+	}
 
-    SPI_execute(deletebuf, false, 0);
+	GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
+	SetUserIdAndSecContext(CronExtensionOwner(), SECURITY_LOCAL_USERID_CHANGE);
 
-    SPI_finish();
+	SPI_execute(deletebuf, false, 0);
+
+	SPI_finish();
+
+	SetUserIdAndSecContext(savedUserId, savedSecurityContext);
+	InvalidateJobCache();
 }
 
 /*
@@ -1637,55 +1288,55 @@ deleteCronExt(int64 jobid, char *jobname)
 void
 queryModeFromCronExt(int64 jobid, char *mode)
 {
-    StringInfoData querybuf;
-    MemoryContext originalContext = CurrentMemoryContext;
-    char *buf = NULL;
+	StringInfoData querybuf;
+	MemoryContext originalContext = CurrentMemoryContext;
+	char *buf = NULL;
 
-    SetCurrentStatementStartTimestamp();
-    StartTransactionCommand();
-    PushActiveSnapshot(GetTransactionSnapshot());
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
 
-    if (!PgCronHasBeenLoaded() || RecoveryInProgress() || !JobLtExtTableExists())
-    {
-        PopActiveSnapshot();
-        CommitTransactionCommand();
-        MemoryContextSwitchTo(originalContext);
-        return;
-    }
+	if (!PgCronHasBeenLoaded() || RecoveryInProgress() || !JobLtExtTableExists())
+	{
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		MemoryContextSwitchTo(originalContext);
+		return;
+	}
 
-    initStringInfo(&querybuf);
+	initStringInfo(&querybuf);
 
-    /* Open SPI context. */
-    if (SPI_connect() != SPI_OK_CONNECT)
-    {
-        elog(ERROR, "SPI_connect failed");
-    }
+	/* Open SPI context. */
+	if (SPI_connect() != SPI_OK_CONNECT)
+	{
+		elog(ERROR, "SPI_connect failed");
+	}
 
-    appendStringInfo(&querybuf, "select mode from %s where jobid = %lld",
-             quote_qualified_identifier(CRON_SCHEMA_NAME, LT_JOB_EXT), (long long int)jobid);
+	appendStringInfo(&querybuf, "select mode from %s where jobid = %lld",
+			quote_qualified_identifier(CRON_SCHEMA_NAME, LT_JOB_EXT), (long long int)jobid);
 
-    pgstat_report_activity(STATE_RUNNING, querybuf.data);
+	pgstat_report_activity(STATE_RUNNING, querybuf.data);
 
-    if (SPI_exec(querybuf.data, 0) != SPI_OK_SELECT)
-    {
-        elog(ERROR, "SPI_exec failed: %s", querybuf.data);
-    }
+	if (SPI_exec(querybuf.data, 0) != SPI_OK_SELECT)
+	{
+		elog(ERROR, "SPI_exec failed: %s", querybuf.data);
+	}
 
-    if (SPI_processed > 0)
-    {
-        buf = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-        if (NULL != mode && NULL != buf)
-        {
-            memcpy(mode, buf, strlen(buf));
-        }
-    }
-    pfree(querybuf.data);
+	if (SPI_processed > 0)
+	{
+		buf = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+		if (NULL != mode && NULL != buf)
+		{
+			memcpy(mode, buf, strlen(buf));
+		}
+	}
+	pfree(querybuf.data);
 
-    SPI_finish();
-    PopActiveSnapshot();
-    CommitTransactionCommand();
-    MemoryContextSwitchTo(originalContext);
-    pgstat_report_activity(STATE_IDLE, NULL);
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+	MemoryContextSwitchTo(originalContext);
+	pgstat_report_activity(STATE_IDLE, NULL);
 }
 
 /*
@@ -1694,55 +1345,55 @@ queryModeFromCronExt(int64 jobid, char *mode)
 void
 queryZoneFromCronExt(int64 jobid, int *tmzone)
 {
-    StringInfoData querybuf;
-    MemoryContext originalContext = CurrentMemoryContext;
-    char *buf = NULL;
+	StringInfoData querybuf;
+	MemoryContext originalContext = CurrentMemoryContext;
+	char *buf = NULL;
 
-    SetCurrentStatementStartTimestamp();
-    StartTransactionCommand();
-    PushActiveSnapshot(GetTransactionSnapshot());
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
 
-    if (!PgCronHasBeenLoaded() || RecoveryInProgress() || !JobLtExtTableExists())
-    {
-        PopActiveSnapshot();
-        CommitTransactionCommand();
-        MemoryContextSwitchTo(originalContext);
-        return;
-    }
+	if (!PgCronHasBeenLoaded() || RecoveryInProgress() || !JobLtExtTableExists())
+	{
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		MemoryContextSwitchTo(originalContext);
+		return;
+	}
 
-    initStringInfo(&querybuf);
+	initStringInfo(&querybuf);
 
-    /* Open SPI context. */
-    if (SPI_connect() != SPI_OK_CONNECT)
-    {
-        elog(ERROR, "SPI_connect failed");
-    }
+	/* Open SPI context. */
+	if (SPI_connect() != SPI_OK_CONNECT)
+	{
+		elog(ERROR, "SPI_connect failed");
+	}
 
-    appendStringInfo(&querybuf, "select timezone from %s where jobid = %lld",
-             quote_qualified_identifier(CRON_SCHEMA_NAME, LT_JOB_EXT), (long long int)jobid);
+	appendStringInfo(&querybuf, "select timezone from %s where jobid = %lld",
+			quote_qualified_identifier(CRON_SCHEMA_NAME, LT_JOB_EXT), (long long int)jobid);
 
-    pgstat_report_activity(STATE_RUNNING, querybuf.data);
+	pgstat_report_activity(STATE_RUNNING, querybuf.data);
 
-    if (SPI_exec(querybuf.data, 0) != SPI_OK_SELECT)
-    {
-        elog(ERROR, "SPI_exec failed: %s", querybuf.data);
-    }
+	if (SPI_exec(querybuf.data, 0) != SPI_OK_SELECT)
+	{
+		elog(ERROR, "SPI_exec failed: %s", querybuf.data);
+	}
 
-    if (SPI_processed > 0)
-    {
-        buf = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-        if (NULL != tmzone && NULL != buf)
-        {
-            (*tmzone) = atoi(buf);
-        }
-    }
-    pfree(querybuf.data);
+	if (SPI_processed > 0)
+	{
+		buf = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+		if (NULL != tmzone && NULL != buf)
+		{
+			(*tmzone) = atoi(buf);
+		}
+	}
+	pfree(querybuf.data);
 
-    SPI_finish();
-    PopActiveSnapshot();
-    CommitTransactionCommand();
-    MemoryContextSwitchTo(originalContext);
-    pgstat_report_activity(STATE_IDLE, NULL);
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+	MemoryContextSwitchTo(originalContext);
+	pgstat_report_activity(STATE_IDLE, NULL);
 }
 
 /*
@@ -1751,51 +1402,51 @@ queryZoneFromCronExt(int64 jobid, int *tmzone)
 void
 updateCronActive(int64 jobid, char *active)
 {
-    StringInfoData updatebuf;
-    MemoryContext originalContext = CurrentMemoryContext;
+	StringInfoData updatebuf;
+	MemoryContext originalContext = CurrentMemoryContext;
 
-    if (NULL == active)
-    {
-        elog(ERROR, "active is null");
-    }
+	if (NULL == active)
+	{
+		elog(ERROR, "active is null");
+	}
 
-    SetCurrentStatementStartTimestamp();
-    StartTransactionCommand();
-    PushActiveSnapshot(GetTransactionSnapshot());
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
 
-    if (!PgCronHasBeenLoaded() || RecoveryInProgress())
-    {
-        PopActiveSnapshot();
-        CommitTransactionCommand();
-        MemoryContextSwitchTo(originalContext);
-        return;
-    }
+	if (!PgCronHasBeenLoaded() || RecoveryInProgress())
+	{
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		MemoryContextSwitchTo(originalContext);
+		return;
+	}
 
-    initStringInfo(&updatebuf);
+	initStringInfo(&updatebuf);
 
-    /* Open SPI context. */
-    if (SPI_connect() != SPI_OK_CONNECT)
-    {
-        elog(ERROR, "SPI_connect failed");
-    }
+	/* Open SPI context. */
+	if (SPI_connect() != SPI_OK_CONNECT)
+	{
+		elog(ERROR, "SPI_connect failed");
+	}
 
-    appendStringInfo(&updatebuf, "update %s set active = '%s' where jobid = %lld",
-                     quote_qualified_identifier(CRON_SCHEMA_NAME, JOBS_TABLE_NAME), active, (long long int)jobid);
+	appendStringInfo(&updatebuf, "update %s set active = '%s' where jobid = %lld",
+			quote_qualified_identifier(CRON_SCHEMA_NAME, JOBS_TABLE_NAME), active, (long long int)jobid);
 
-    pgstat_report_activity(STATE_RUNNING, updatebuf.data);
+	pgstat_report_activity(STATE_RUNNING, updatebuf.data);
 
-    if (SPI_exec(updatebuf.data, 0) != SPI_OK_UPDATE)
-    {
-        elog(ERROR, "SPI_exec failed: %s", updatebuf.data);
-    }
+	if (SPI_exec(updatebuf.data, 0) != SPI_OK_UPDATE)
+	{
+		elog(ERROR, "SPI_exec failed: %s", updatebuf.data);
+	}
 
-    pfree(updatebuf.data);
+	pfree(updatebuf.data);
 
-    SPI_finish();
-    PopActiveSnapshot();
-    CommitTransactionCommand();
-    MemoryContextSwitchTo(originalContext);
-    pgstat_report_activity(STATE_IDLE, NULL);
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+	MemoryContextSwitchTo(originalContext);
+	pgstat_report_activity(STATE_IDLE, NULL);
 }
 
 /*
@@ -1804,73 +1455,73 @@ updateCronActive(int64 jobid, char *active)
 void
 keepDataFromCronRun()
 {
-    StringInfoData querybuf;
-    StringInfoData deletebuf;
-    MemoryContext originalContext = CurrentMemoryContext;
-    int row_num = 0;
-    char *buf = NULL;
+	StringInfoData querybuf;
+	StringInfoData deletebuf;
+	MemoryContext originalContext = CurrentMemoryContext;
+	int row_num = 0;
+	char *buf = NULL;
 
-    SetCurrentStatementStartTimestamp();
-    StartTransactionCommand();
-    PushActiveSnapshot(GetTransactionSnapshot());
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
 
-    if (!PgCronHasBeenLoaded() || RecoveryInProgress() || !JobRunDetailsTableExists())
-    {
-        PopActiveSnapshot();
-        CommitTransactionCommand();
-        MemoryContextSwitchTo(originalContext);
-        return;
-    }
+	if (!PgCronHasBeenLoaded() || RecoveryInProgress() || !JobRunDetailsTableExists())
+	{
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		MemoryContextSwitchTo(originalContext);
+		return;
+	}
 
-    initStringInfo(&querybuf);
+	initStringInfo(&querybuf);
 
-    /* Open SPI context. */
-    if (SPI_connect() != SPI_OK_CONNECT)
-    {
-        elog(ERROR, "SPI_connect failed");
-    }
+	/* Open SPI context. */
+	if (SPI_connect() != SPI_OK_CONNECT)
+	{
+		elog(ERROR, "SPI_connect failed");
+	}
 
-    appendStringInfo(&querybuf, "select count(*) from %s",
-                     quote_qualified_identifier(CRON_SCHEMA_NAME, JOB_RUN_DETAILS_TABLE_NAME));
+	appendStringInfo(&querybuf, "select count(*) from %s",
+			quote_qualified_identifier(CRON_SCHEMA_NAME, JOB_RUN_DETAILS_TABLE_NAME));
 
-    pgstat_report_activity(STATE_RUNNING, querybuf.data);
+	pgstat_report_activity(STATE_RUNNING, querybuf.data);
 
-    if (SPI_exec(querybuf.data, 0) != SPI_OK_SELECT)
-    {
-        elog(ERROR, "SPI_exec failed: %s", querybuf.data);
-    }
+	if (SPI_exec(querybuf.data, 0) != SPI_OK_SELECT)
+	{
+		elog(ERROR, "SPI_exec failed: %s", querybuf.data);
+	}
 
-    if (SPI_processed > 0)
-    {
-        buf = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-        if (NULL != buf)
-        {
-            row_num = atoi(buf);
-        }
-    }
-    pfree(querybuf.data);
+	if (SPI_processed > 0)
+	{
+		buf = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+		if (NULL != buf)
+		{
+			row_num = atoi(buf);
+		}
+	}
+	pfree(querybuf.data);
 
-    if (100000 < row_num)
-    {
-        initStringInfo(&deletebuf);
+	if (100000 < row_num)
+	{
+		initStringInfo(&deletebuf);
 
-        appendStringInfo(&deletebuf, "delete from %s where runid in (select runid from %s order by runid desc limit (select count(runid) from %s) offset 100000)",
-             quote_qualified_identifier(CRON_SCHEMA_NAME, JOB_RUN_DETAILS_TABLE_NAME), quote_qualified_identifier(CRON_SCHEMA_NAME, JOB_RUN_DETAILS_TABLE_NAME),
-                         quote_qualified_identifier(CRON_SCHEMA_NAME, JOB_RUN_DETAILS_TABLE_NAME));
+		appendStringInfo(&deletebuf, "delete from %s where runid in (select runid from %s order by runid desc limit (select count(runid) from %s) offset 100000)",
+				quote_qualified_identifier(CRON_SCHEMA_NAME, JOB_RUN_DETAILS_TABLE_NAME), quote_qualified_identifier(CRON_SCHEMA_NAME, JOB_RUN_DETAILS_TABLE_NAME),
+				quote_qualified_identifier(CRON_SCHEMA_NAME, JOB_RUN_DETAILS_TABLE_NAME));
 
-        pgstat_report_activity(STATE_RUNNING, deletebuf.data);
+		pgstat_report_activity(STATE_RUNNING, deletebuf.data);
 
-        if (SPI_exec(deletebuf.data, 0) != SPI_OK_DELETE)
-        {
-            elog(ERROR, "SPI_exec failed: %s", deletebuf.data);
-        }
+		if (SPI_exec(deletebuf.data, 0) != SPI_OK_DELETE)
+		{
+			elog(ERROR, "SPI_exec failed: %s", deletebuf.data);
+		}
 
-        pfree(deletebuf.data);
-    }
+		pfree(deletebuf.data);
+	}
 
-    SPI_finish();
-    PopActiveSnapshot();
-    CommitTransactionCommand();
-    MemoryContextSwitchTo(originalContext);
-    pgstat_report_activity(STATE_IDLE, NULL);
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+	MemoryContextSwitchTo(originalContext);
+	pgstat_report_activity(STATE_IDLE, NULL);
 }
