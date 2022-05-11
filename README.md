@@ -204,3 +204,12 @@ It has been enhanced on the basis of standard cron syntax to supports second-lev
 ```
 
 For security, jobs are executed in the database in which the cron.schedule function is called with the same permissions as the current user. In addition, users are only able to see their own jobs in the `cron.job` table and `cron.lt_job` view.
+
+
+
+Test example：
+
+![image-20220511203057950](C:\Users\tianxf42813\AppData\Roaming\Typora\typora-user-images\image-20220511203057950.png)
+
+
+
