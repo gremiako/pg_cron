@@ -209,7 +209,7 @@ For security, jobs are executed in the database in which the cron.schedule funct
 
 Test example：
 
-![image-20220511203057950](C:\Users\tianxf42813\AppData\Roaming\Typora\typora-user-images\image-20220511203057950.png)
+![image-20220511203057950](./image-20220511203057950.png)
 
 
 
