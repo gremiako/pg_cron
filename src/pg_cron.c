@@ -36,6 +36,7 @@
 #include "pg_cron.h"
 #include "task_states.h"
 #include "job_metadata.h"
+#include "lt_linux_cron.h"
 
 #include "poll.h"
 #include "sys/time.h"
@@ -153,7 +154,7 @@ static bool jobRunningTimeout(CronTask *task, TimestampTz currentTime);
 /* global settings */
 char *CronTableDatabaseName = "postgres";
 static bool CronLogStatement = true;
-static bool CronLogRun = true;
+bool CronLogRun = true;
 static bool CronReloadConfig = false;
 
 /* flags set by signal handlers */
@@ -173,6 +174,7 @@ static TimestampTz g_lastKeepRunDetailes = 0;
 
 static int MaxConnectPerTask = 0;
 static int MaxRunTaskTimeout = 0;
+static int MaxRunLinuxTaskTimeout = 0;
 
 
 /*
@@ -300,6 +302,20 @@ _PG_init(void)
 		30,
 		0,
 		1800,
+		PGC_POSTMASTER,
+		GUC_SUPERUSER_ONLY,
+		NULL, NULL, NULL);
+	/*
+	 * lightdb add 2022/5/10 for S202204117426
+	 */
+	DefineCustomIntVariable(
+		"cron.linux_task_running_timeout",
+		gettext_noop("Maximum timeout of execution that each linux task can run."),
+		NULL,
+		&MaxRunLinuxTaskTimeout,
+		30,
+		0,
+		43200,
 		PGC_POSTMASTER,
 		GUC_SUPERUSER_ONLY,
 		NULL, NULL, NULL);
@@ -673,15 +689,7 @@ StartAllPendingRuns(List *taskList, TimestampTz currentTime)
 		{
 			CronTask *task = (CronTask *) lfirst(taskCell);
 			CronJob *cronJob = GetCronJob(task->jobId);
-			entry *schedule = NULL;
-			if(cronJob)
-			{
-				schedule = &cronJob->schedule;
-			}
-			else
-			{
-				return;
-			}
+			entry *schedule = &cronJob->schedule;
 
 			if (schedule->flags & WHEN_REBOOT)
 			{
@@ -724,7 +732,7 @@ static void
 StartPendingRuns(CronTask *task, TimestampTz currentTime)
 {
 	CronJob *cronJob = GetCronJob(task->jobId);
-	entry *schedule = NULL;
+	entry *schedule = &cronJob->schedule;
 	TimestampTz virtualTime;
 	TimestampTz currentTimeStart;
 	ClockProgress clockProgress;
@@ -733,20 +741,11 @@ StartPendingRuns(CronTask *task, TimestampTz currentTime)
 	int secondsPassed = 0;
 	bool is_second = false;
 
-	if (cronJob)
-	{
-		is_second = isSecondSchedule(cronJob->scheduleText);
-		schedule = &cronJob->schedule;
-	}
-	else
-	{
-		return;
-	}
-	
+	is_second = isSecondSchedule(cronJob->scheduleText);
 	if (is_second)
 	{
-        /* second interval
-        */
+		/* second interval
+		*/
 		timestampTzMilli = 1000;
 		currentTimeStart = TimestampSecondStart(currentTime);
 		if (g_lastSecond == 0)
@@ -791,8 +790,8 @@ StartPendingRuns(CronTask *task, TimestampTz currentTime)
 	}
 	else
 	{
-        /* minute interval
-        */
+		/* minute interval
+		*/
 		timestampTzMilli = 60 * 1000;
 		currentTimeStart = TimestampMinuteStart(currentTime);
 		if (g_lastMinute == 0)
@@ -1072,15 +1071,15 @@ ShouldRunTask(CronTask *task, entry *schedule, TimestampTz currentTime, bool doW
 	int dayOfWeek = 0;
 	
 	int timecfg = 0;
-	int tmzone = 0;
+	char tmzone[DEFAULT_FILED_LEN] = {0};
 	TimestampTz tm_off = 0;
 	bool is_second = false;
 	CronJob *cronJob = GetCronJob(task->jobId);
 
 	/* get time zone offset
 	*/
-	queryZoneFromCronExt(task->jobId, &tmzone);
-	tm_off = (long long int)tmzone * 60 * 60 * 1000000;
+	queryFiledFromCron(task->jobId, LT_JOB_EXT, "timezone", tmzone, DEFAULT_FILED_LEN);
+	tm_off = (long long int)(atoi(tmzone)) * 60 * 60 * 1000000;
 
 	currentTime_t = timestamptz_to_time_t((currentTime + tm_off));
 	tm = gmtime(&currentTime_t);
@@ -1092,15 +1091,7 @@ ShouldRunTask(CronTask *task, entry *schedule, TimestampTz currentTime, bool doW
 	month = tm->tm_mon +1 -FIRST_MONTH;
 	dayOfWeek = tm->tm_wday -FIRST_DOW;
 
-	if (cronJob)
-	{
-		is_second = isSecondSchedule(cronJob->scheduleText);
-	}
-	else
-	{
-		return false;
-	}
-	
+	is_second = isSecondSchedule(cronJob->scheduleText);
 	/* if there is a second parameter, add the second detection
 	 */
 	if (is_second)
@@ -1267,7 +1258,7 @@ PollForTasks(List *taskList)
 							}
 
 							if (_curNode->state == CRON_TASK_ERROR || _curNode->state == CRON_TASK_DONE ||
-							CronFixedStartTask(_curNode))
+								CronFixedStartTask(_curNode))
 							{
 								/* there is work to be done, don't wait */
 								pfree(polledTasks);
@@ -1278,6 +1269,11 @@ PollForTasks(List *taskList)
 							if (_curNode->state == CRON_TASK_WAITING && _curNode->pendingRunCount == 0)
 							{
 								/* don't poll idle tasks */
+								continue;
+							}
+
+							if (CRON_COMMAND_TYPE_LINUX == _curNode->commandtype)
+							{
 								continue;
 							}
 
@@ -1380,6 +1376,11 @@ PollForTasks(List *taskList)
 				}
 			}
 
+			if (CRON_COMMAND_TYPE_LINUX == task->commandtype)
+			{
+				continue;
+			}
+
 			/* we plan to poll this task */
 			pollFileDescriptor = &pollFDs[activeTaskCount];
 			polledTasks[activeTaskCount] = task;
@@ -1476,8 +1477,11 @@ PollForTasks(List *taskList)
 		CronTask *task = polledTasks[taskIndex];
 		struct pollfd *pollFileDescriptor = &pollFDs[taskIndex];
 
-		task->isSocketReady = pollFileDescriptor->revents &
-						  pollFileDescriptor->events;
+		if (CRON_COMMAND_TYPE_SQL == task->commandtype)
+		{
+			task->isSocketReady = pollFileDescriptor->revents &
+			  pollFileDescriptor->events;
+		}
 	}
 
 	pfree(polledTasks);
@@ -1575,17 +1579,28 @@ ManageCronTasks(List *taskList, TimestampTz currentTime)
 	{
 		CronTask *task = (CronTask *) lfirst(taskCell);
 
-		/* fixed interval mode cron task.
-		 * lightdb add 2022/3/16 for S202203046035
-		 */
 		switch(task->mode)
 		{
+			/* fixed interval mode cron task.
+			 * lightdb add 2022/5/20
+			 */
 			case CRON_MODE_FIXED:
 			{
 				List *fixedTaskList = NIL;
 				ListCell *_cell = NULL;
-				unsigned int connectCount = queryTaskConnections(task->jobId);
+				unsigned int connectCount = 0;
 
+				/* the current task has been switched to fixed mode, and you need to 
+				 * wait for the previous mode to complete before executing the fixed mode.
+				 * lightdb add 2022/3/16 for S202203046035
+				 */
+				if (CRON_TASK_WAITING != task->state)
+				{
+					ManageCronTask(task, currentTime);
+					break;
+				}
+					
+				connectCount = queryTaskConnections(task->jobId);
 				if (task->isActive && connectCount < task->pendingRunCount && (unsigned int)MaxConnectPerTask > connectCount)
 				{
 					RefreshFixedTaskHash(task);
@@ -1601,7 +1616,7 @@ ManageCronTasks(List *taskList, TimestampTz currentTime)
 						{
 							if (task->jobId == _curNode->jobId)
 							{
-								int offsetlen = sizeof(int64) * 2;
+								int offsetlen = sizeof(task->jobId) + sizeof(task->runId);
 								CronTask temp;
 								memset(&temp, 0, sizeof(CronTask));
 
@@ -1623,8 +1638,46 @@ ManageCronTasks(List *taskList, TimestampTz currentTime)
 
 			default:
 			{
-				ManageCronTask(task, currentTime);
-			}	
+				
+				/* the current task has been switched to next/asap/single mode. It is necessary to judge and 
+				 * wait for the execution of the previous fixed mode to complete before continuing to execute.
+				 * lightdb add 2022/3/16 for S202203046035
+				 */
+				List *fixedTaskList = NIL;
+				ListCell *_cell = NULL;
+				bool isLastFixedRunning = false;
+
+				fixedTaskList = CurrentFixedTaskList();
+				if (fixedTaskList)
+				{
+					foreach (_cell, fixedTaskList)
+					{
+						CronFixedTask* _curNode = (CronFixedTask *) lfirst(_cell);
+						if (_curNode)
+						{
+							if (task->jobId == _curNode->jobId)
+							{
+								int offsetlen = sizeof(task->jobId) + sizeof(task->runId);
+								CronTask temp;
+								isLastFixedRunning = true;
+								memset(&temp, 0, sizeof(CronTask));
+
+								_curNode->isActive = task->isActive;
+								temp.jobId = _curNode->jobId;
+								temp.runId = _curNode->runId;
+								memcpy((char*)&temp + offsetlen, (char*)_curNode + offsetlen, sizeof(CronTask) - offsetlen);
+								ManageCronTask(&temp, currentTime);
+								memcpy((char*)_curNode + offsetlen, (char*)&temp + offsetlen, sizeof(CronTask) - offsetlen);
+							}
+						}
+					}
+
+					cron_list_del(fixedTaskList, task);
+				}
+
+				if (!isLastFixedRunning)
+					ManageCronTask(task, currentTime);
+			}
 		}
 	}
 }
@@ -1642,11 +1695,6 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 	PGconn *connection = task->connection;
 	ConnStatusType connectionStatus = CONNECTION_BAD;
 	TimestampTz start_time;
-
-	if (!cronJob)
-	{
-		return;
-	}
 
 	switch (checkState)
 	{
@@ -1690,68 +1738,83 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 			/* as there is no break at the end of the previous case
 			 * to not add an extra second, then do another check here
 			 */
-			if (!UseBackgroundWorkers)
+			if (CRON_COMMAND_TYPE_SQL == task->commandtype)
 			{
-				const char *clientEncoding = GetDatabaseEncodingName();
-				char nodePortString[12];
-				TimestampTz startDeadline = 0;
+				if (!UseBackgroundWorkers)
+				{
+					const char *clientEncoding = GetDatabaseEncodingName();
+					char nodePortString[12];
+					TimestampTz startDeadline = 0;
 
-				const char *keywordArray[] = {
-					"host",
-					"port",
-					"fallback_application_name",
-					"client_encoding",
-					"dbname",
-					"user",
-					NULL
+					const char *keywordArray[] = {
+						"host",
+						"port",
+						"fallback_application_name",
+						"client_encoding",
+						"dbname",
+						"user",
+						NULL
+						};
+					const char *valueArray[] = {
+						cronJob->nodeName,
+						nodePortString,
+						"pg_cron",
+						clientEncoding,
+						cronJob->database,
+						cronJob->userName,
+						NULL
 					};
-				const char *valueArray[] = {
-					cronJob->nodeName,
-					nodePortString,
-					"pg_cron",
-					clientEncoding,
-					cronJob->database,
-					cronJob->userName,
-					NULL
-				};
-				sprintf(nodePortString, "%d", cronJob->nodePort);
+					sprintf(nodePortString, "%d", cronJob->nodePort);
 
-				Assert(sizeof(keywordArray) == sizeof(valueArray));
+					Assert(sizeof(keywordArray) == sizeof(valueArray));
 
-				/*if (CronLogStatement)
-				{
-					char *command = cronJob->command;
+					/*if (CronLogStatement)
+					{
+						char *command = cronJob->command;
 
-					ereport(LOG, (errmsg("cron job " INT64_FORMAT " %s: %s",
-									 jobId, GetCronStatus(CRON_STATUS_STARTING), command)));
-				}*/
+						ereport(LOG, (errmsg("cron job " INT64_FORMAT " %s: %s",
+										 jobId, GetCronStatus(CRON_STATUS_STARTING), command)));
+					}*/
 
-				connection = PQconnectStartParams(keywordArray, valueArray, false);
-				PQsetnonblocking(connection, 1);
+					connection = PQconnectStartParams(keywordArray, valueArray, false);
+					PQsetnonblocking(connection, 1);
 
-				connectionStatus = PQstatus(connection);
-				if (connectionStatus == CONNECTION_BAD)
-				{
-					/* make sure we call PQfinish on the connection */
+					connectionStatus = PQstatus(connection);
+					if (connectionStatus == CONNECTION_BAD)
+					{
+						/* make sure we call PQfinish on the connection */
+						task->connection = connection;
+
+						task->errorMessage = "connection failed";
+						task->pollingStatus = 0;
+						task->state = CRON_TASK_ERROR;
+						break;
+					}
+
+					startDeadline = TimestampTzPlusMilliseconds(currentTime,
+												CronTaskStartTimeout);
+
+					task->startDeadline = startDeadline;
 					task->connection = connection;
+					task->pollingStatus = PGRES_POLLING_WRITING;
+					task->state = CRON_TASK_CONNECTING;
 
-					task->errorMessage = "connection failed";
-					task->pollingStatus = 0;
-					task->state = CRON_TASK_ERROR;
+					if (CronLogRun)
+						UpdateJobRunDetail(task->runId, NULL, GetCronStatus(CRON_STATUS_CONNECTING), NULL, NULL, NULL);
+
 					break;
-				}
-
-				startDeadline = TimestampTzPlusMilliseconds(currentTime,
-											CronTaskStartTimeout);
-
-				task->startDeadline = startDeadline;
-				task->connection = connection;
-				task->pollingStatus = PGRES_POLLING_WRITING;
-				task->state = CRON_TASK_CONNECTING;
-
-				if (CronLogRun)
-					UpdateJobRunDetail(task->runId, NULL, GetCronStatus(CRON_STATUS_CONNECTING), NULL, NULL, NULL);
-
+				}			
+			}
+			else
+			{
+				/* pg_cron linux command start
+				 * lightdb add 2022/4/20 for S202204117426
+				 */
+				if (MaxRunLinuxTaskTimeout)
+					task->startDeadline = TimestampTzPlusMilliseconds(currentTime, (MaxRunLinuxTaskTimeout * 1000));
+				
+				ManageLinuxCronTask(task);
+				
 				break;
 			}
 		}
@@ -2045,78 +2108,111 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 
 		case CRON_TASK_RUNNING:
 		{
-			int connectionBusy = 0;
-			PGresult *result = NULL;
-			Assert(!UseBackgroundWorkers);
-
-			/* check if job has been removed */
-			if (jobCanceled(task))
-				break;
-			/*
-			 * check if timeout has been reached 
-			 * lightdb add 2022/4/2 for S202204026369
-			 */
-			if (MaxRunTaskTimeout && jobRunningTimeout(task, currentTime))
+			if (CRON_COMMAND_TYPE_SQL == task->commandtype)
 			{
-				if (connection)
+				int connectionBusy = 0;
+				PGresult *result = NULL;
+				Assert(!UseBackgroundWorkers);
+
+				/* check if job has been removed */
+				if (jobCanceled(task))
+					break;
+				/*
+				 * check if timeout has been reached 
+				 * lightdb add 2022/4/20 for S202204026369
+				 */
+				if (MaxRunTaskTimeout && jobRunningTimeout(task, currentTime))
 				{
-					char errbuf[256] = {0};
-					PGcancel *cancel = PQgetCancel(connection);
-
-					if (cancel)
+					if (connection)
 					{
-						if (1 != PQcancel(cancel, errbuf, 256))
+						char errbuf[256] = {0};
+						PGcancel *cancel = PQgetCancel(connection);
+
+						if (cancel)
 						{
-							task->errorMessage = errbuf;
+							if (1 != PQcancel(cancel, errbuf, 256))
+							{
+								task->errorMessage = errbuf;
+							}
+							
+							PQfreeCancel(cancel);
 						}
-						
-						PQfreeCancel(cancel);
 					}
+					
+					break;
 				}
-				
-				break;
-			}
 
-			/* check if connection is still alive */
-			connectionStatus = PQstatus(connection);
-			if (connectionStatus == CONNECTION_BAD)
-			{
-				task->errorMessage = "connection lost";
+				/* check if connection is still alive */
+				connectionStatus = PQstatus(connection);
+				if (connectionStatus == CONNECTION_BAD)
+				{
+					task->errorMessage = "connection lost";
+					task->pollingStatus = 0;
+					task->state = CRON_TASK_ERROR;
+					break;
+				}
+
+				/* check if socket is ready to send */
+				if (!task->isSocketReady)
+				{
+					break;
+				}
+
+				PQconsumeInput(connection);
+
+				connectionBusy = PQisBusy(connection);
+
+				if (connectionBusy)
+				{
+					/* still waiting for results */
+					
+					break;
+				}
+
+				while ((result = PQgetResult(connection)) != NULL)
+				{
+					GetTaskFeedback(result, task);
+				}
+
+				PQfinish(connection);
+
+				task->connection = NULL;
 				task->pollingStatus = 0;
-				task->state = CRON_TASK_ERROR;
-				break;
-			}
+				task->isSocketReady = false;
 
-			/* check if socket is ready to send */
-			if (!task->isSocketReady)
+				task->state = CRON_TASK_DONE;
+				RunningTaskCount--;
+			}
+			else
 			{
-				break;
+				/* pg_cron linux command running
+				 * lightdb add 2022/4/20 for S202204117426
+				 */
+				 pid_t pid;
+			
+				/* check if job has been removed */
+				if (jobCanceled(task))
+				{
+					TerminateBackgroundWorker(&task->handle);
+					WaitForBackgroundWorkerShutdown(&task->handle);
+					break;
+				}
+
+				/*if (MaxRunLinuxTaskTimeout && jobRunningTimeout(task, currentTime))
+				{
+					TerminateBackgroundWorker(&task->handle);
+					WaitForBackgroundWorkerShutdown(&task->handle);
+					break;
+				}*/
+
+				/* still waiting for job to complete */
+				if (GetBackgroundWorkerPid(&task->handle, &pid) != BGWH_STOPPED)
+					break;
+
+				task->state = CRON_TASK_DONE;
+				RunningTaskCount--;
 			}
-
-			PQconsumeInput(connection);
-
-			connectionBusy = PQisBusy(connection);
-
-			if (connectionBusy)
-			{
-				/* still waiting for results */
-				
-				break;
-			}
-
-			while ((result = PQgetResult(connection)) != NULL)
-			{
-				GetTaskFeedback(result, task);
-			}
-
-			PQfinish(connection);
-
-			task->connection = NULL;
-			task->pollingStatus = 0;
-			task->isSocketReady = false;
-
-			task->state = CRON_TASK_DONE;
-			RunningTaskCount--;
+			
 
 			break;
 		}
@@ -2197,8 +2293,6 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 			task->isSocketReady = false;
 			task->state = CRON_TASK_DONE;
 
-			RunningTaskCount--;
-
 			/* fall through to CRON_TASK_DONE */
 		}
 
@@ -2206,8 +2300,18 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 		default:
 		{
 			int currentPendingRunCount = task->pendingRunCount;
+			CronJob *job = GetCronJob(jobId);
 
-			InitializeCronTask(task, jobId);
+			/*
+			 * It may happen that job was unscheduled during task execution.
+			 * In this case we keep task as-is. Otherwise, we should
+			 * re-initialize task, i.e. reset fields to initial values including
+			 * status.
+			 */
+			if (job != NULL && job->active)
+				InitializeCronTask(task, jobId);
+			else
+				task->state = CRON_TASK_WAITING;
 
 			/*
 			 * We keep the number of runs that should have started while

@@ -58,31 +58,30 @@
 
 #define EXTENSION_NAME "pg_cron"
 #define CRON_SCHEMA_NAME "cron"
-#define JOBS_TABLE_NAME "job"
 #define JOB_ID_INDEX_NAME "job_pkey"
 #define JOB_ID_SEQUENCE_NAME "cron.jobid_seq"
 #define JOB_RUN_DETAILS_TABLE_NAME "job_run_details"
 #define RUN_ID_SEQUENCE_NAME "cron.runid_seq"
-#define LT_JOB_EXT "lt_job_ext"
 
 #define DEFAULT_TIME_ZONE	"8"
 
 /* forward declarations */
 static HTAB * CreateCronJobHash(void);
 
-static int64 ScheduleCronJob(Name jobName, char *schedule, char *command, char *mode, char *tmzone);
+static int64 ScheduleCronJob(Name jobName, char *schedule, char *command, char *mode, char *tmzone, char *cmdtype);
 static Oid CronExtensionOwner(void);
 static void EnsureDeletePermission(Relation cronJobsTable, HeapTuple heapTuple);
 static void InvalidateJobCacheCallback(Datum argument, Oid relationId);
 static void InvalidateJobCache(void);
 static Oid CronJobRelationId(void);
+static bool is_number(char *arg);
 
 static CronJob * TupleToCronJob(TupleDesc tupleDescriptor, HeapTuple heapTuple);
 static bool PgCronHasBeenLoaded(void);
 static bool JobRunDetailsTableExists(void);
 
 static bool JobLtExtTableExists(void);
-static void insertCronExt(int64 jobid, char *jobname, char *mode, char *tmzone);
+static void insertCronExt(int64 jobid, char *jobname, char *mode, char *tmzone, char *cmdtype);
 static void deleteCronExt(int64 jobid, char *jobname);
 
 /* SQL-callable functions */
@@ -93,6 +92,7 @@ PG_FUNCTION_INFO_V1(cron_unschedule_named);
 PG_FUNCTION_INFO_V1(cron_job_cache_invalidate);
 PG_FUNCTION_INFO_V1(cron_schedule_named_mode);
 PG_FUNCTION_INFO_V1(cron_schedule_named_mode_zone);
+PG_FUNCTION_INFO_V1(cron_schedule_named_mode_zone_cmdtype);
 
 
 /* global variables */
@@ -188,7 +188,7 @@ cron_schedule(PG_FUNCTION_ARGS)
 	char *schedule = text_to_cstring(scheduleText);
 	char *command = text_to_cstring(commandText);
 
-	int64 jobId = ScheduleCronJob(jobName, schedule, command, MODE_NEXT, DEFAULT_TIME_ZONE);
+	int64 jobId = ScheduleCronJob(jobName, schedule, command, MODE_NEXT, DEFAULT_TIME_ZONE, COMMAND_SQL);
 
 	PG_RETURN_INT64(jobId);
 }
@@ -207,7 +207,7 @@ cron_schedule_named(PG_FUNCTION_ARGS)
 	char *schedule = text_to_cstring(scheduleText);
 	char *command = text_to_cstring(commandText);
 
-	int64 jobId = ScheduleCronJob(jobName, schedule, command, MODE_NEXT, DEFAULT_TIME_ZONE);
+	int64 jobId = ScheduleCronJob(jobName, schedule, command, MODE_NEXT, DEFAULT_TIME_ZONE, COMMAND_SQL);
 
 	PG_RETURN_INT64(jobId);
 }
@@ -227,7 +227,7 @@ cron_schedule_named_mode(PG_FUNCTION_ARGS)
 	char *command = text_to_cstring(commandText);
 	char *mode = text_to_cstring(modeText);
 
-	int64 jobId = ScheduleCronJob(jobName, schedule, command, mode, DEFAULT_TIME_ZONE);
+	int64 jobId = ScheduleCronJob(jobName, schedule, command, mode, DEFAULT_TIME_ZONE, COMMAND_SQL);
 
 	PG_RETURN_INT64(jobId);
 }
@@ -249,16 +249,41 @@ cron_schedule_named_mode_zone(PG_FUNCTION_ARGS)
 	char *mode = text_to_cstring(modeText);
 	char *tmzone = text_to_cstring(zoneText);
 
-	int64 jobId = ScheduleCronJob(jobName, schedule, command, mode, tmzone);
+	int64 jobId = ScheduleCronJob(jobName, schedule, command, mode, tmzone, COMMAND_SQL);
 
 	PG_RETURN_INT64(jobId);
 }
 
 /*
+ * cron_schedule_named_mode_zone schedules a commandtype cron job
+ */
+Datum
+cron_schedule_named_mode_zone_cmdtype(PG_FUNCTION_ARGS)
+{
+	Name jobName = PG_GETARG_NAME(0);
+	text *scheduleText = PG_GETARG_TEXT_P(1);
+	text *commandText = PG_GETARG_TEXT_P(2);
+	text *modeText = PG_GETARG_TEXT_P(3);
+	text *zoneText = PG_GETARG_TEXT_P(4);
+	text *cmdtypeText = PG_GETARG_TEXT_P(5);
+
+	char *schedule = text_to_cstring(scheduleText);
+	char *command = text_to_cstring(commandText);
+	char *mode = text_to_cstring(modeText);
+	char *tmzone = text_to_cstring(zoneText);
+	char *cmdtype = text_to_cstring(cmdtypeText);
+
+	int64 jobId = ScheduleCronJob(jobName, schedule, command, mode, tmzone, cmdtype);
+
+	PG_RETURN_INT64(jobId);
+}
+
+
+/*
  * ScheduleCronJob schedules a cron job with the given name/mode/zone.
  */
 static int64
-ScheduleCronJob(Name jobName, char *schedule, char *command, char *mode, char *tmzone)
+ScheduleCronJob(Name jobName, char *schedule, char *command, char *mode, char *tmzone, char *cmdtype)
 {
 	entry *parsedSchedule = NULL;
 
@@ -280,6 +305,37 @@ ScheduleCronJob(Name jobName, char *schedule, char *command, char *mode, char *t
 	Oid userId = GetUserId();
 	char *userName = GetUserNameFromId(userId, false);
 
+	if (strcmp(MODE_SINGLE, mode) && strcmp(MODE_TIMING, mode) && strcmp(MODE_ASAP, mode)
+		 && strcmp(MODE_NEXT, mode) && strcmp(MODE_FIXED, mode))
+	{
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("invalid mode: %s, the range is 'single', 'asap', 'next' or 'fixed'", mode)));
+	}
+
+	if (!is_number(tmzone) || 12 < atoi(tmzone) || -12 > atoi(tmzone))
+	{
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("invalid timezone: %s, the range is -12 ~ 12", tmzone)));
+	}
+
+	if (strcmp(COMMAND_SQL, cmdtype) && strcmp(COMMAND_LINUX, cmdtype))
+	{
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("invalid commandtype: %s, the range is 'sql' or 'linux'", cmdtype)));
+	}
+
+	/* pg_cron linux command execution requires superuser
+	 * lightdb add 2022/4/20 for S202204117426
+	 */
+	if (!strcmp(COMMAND_LINUX, cmdtype))
+	{
+		if (!superuser())
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("linux commands must be superuser")));
+
+		if (1024 < strlen(command))
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid linux commands length, the maximum length is 1024")));
+	}
+
 	parsedSchedule = parse_cron_entry(schedule);
 	if (parsedSchedule == NULL)
 	{
@@ -288,20 +344,6 @@ ScheduleCronJob(Name jobName, char *schedule, char *command, char *mode, char *t
 	}
 
 	free_entry(parsedSchedule);
-
-	if (strcmp(MODE_SINGLE, mode) && strcmp(MODE_TIMING, mode) && strcmp(MODE_ASAP, mode)
-		 && strcmp(MODE_NEXT, mode) && strcmp(MODE_FIXED, mode))
-	{
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						errmsg("invalid mode: %s", mode)));
-	}
-
-
-	if (12 < atoi(tmzone) || -12 > atoi(tmzone))
-	{
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						errmsg("invalid timezone: %s", tmzone)));
-	}
 
 	initStringInfo(&querybuf);
 
@@ -393,7 +435,7 @@ ScheduleCronJob(Name jobName, char *schedule, char *command, char *mode, char *t
 
 	SPI_finish();
 
-	insertCronExt(jobId, (char *)jobName, mode, tmzone);
+	insertCronExt(jobId, (char *)jobName, mode, tmzone, cmdtype);
 
 	SetUserIdAndSecContext(savedUserId, savedSecurityContext);
 
@@ -402,6 +444,28 @@ ScheduleCronJob(Name jobName, char *schedule, char *command, char *mode, char *t
 	return jobId;
 }
 
+/*
+ * Check if it is a string number
+ */
+static bool
+is_number(char *arg)
+{
+	if (NULL == arg || 0 == strlen(arg))
+	{
+		return false;
+	}
+
+	for (unsigned int i = 0; i < strlen(arg); i++)
+	{
+		if (0 == i && '-' == arg[i] && 1 < strlen(arg))
+			continue;
+	
+		if (0 == isdigit(arg[i]))
+			return false;
+	}
+
+	return true;
+}
 
 /*
  * NextRunId draws a new run ID from cron.runid_seq.
@@ -1187,7 +1251,7 @@ JobLtExtTableExists(void)
  * insert data into cron.lt_job_ext
  */
 static void
-insertCronExt(int64 jobid, char *jobname, char *mode, char *tmzone)
+insertCronExt(int64 jobid, char *jobname, char *mode, char *tmzone, char *cmdtype)
 {
 	char updatebuf[1024] = {0};
 	Oid savedUserId = InvalidOid;
@@ -1209,14 +1273,14 @@ insertCronExt(int64 jobid, char *jobname, char *mode, char *tmzone)
 	if (NULL == jobname)
 	{
 		snprintf(updatebuf, 1024,
-			"insert into %s (jobid, username, mode, timezone) values (%lld, '%s', '%s', %s) on conflict on constraint jobid_username_uniq do update set mode = EXCLUDED.mode, timezone = EXCLUDED.timezone",
-			quote_qualified_identifier(CRON_SCHEMA_NAME, LT_JOB_EXT), (long long int)jobid, userName, mode, tmzone);
+			"insert into %s (jobid, username, mode, timezone, commandtype) values (%lld, '%s', '%s', '%s', '%s') on conflict on constraint jobid_username_uniq do update set mode = EXCLUDED.mode, timezone = EXCLUDED.timezone, commandtype = EXCLUDED.commandtype",
+			quote_qualified_identifier(CRON_SCHEMA_NAME, LT_JOB_EXT), (long long int)jobid, userName, mode, tmzone, cmdtype);
 	}
 	else
 	{
 		snprintf(updatebuf, 1024,
-			"insert into %s (jobid, jobname, username, mode, timezone) values (%lld, '%s', '%s', '%s', %s) on conflict on constraint jobid_username_uniq do update set mode = EXCLUDED.mode, timezone = EXCLUDED.timezone",
-			quote_qualified_identifier(CRON_SCHEMA_NAME, LT_JOB_EXT), (long long int)jobid, jobname, userName, mode, tmzone);
+			"insert into %s (jobid, jobname, username, mode, timezone, commandtype) values (%lld, '%s', '%s', '%s', '%s', '%s') on conflict on constraint jobid_username_uniq do update set mode = EXCLUDED.mode, timezone = EXCLUDED.timezone, commandtype = EXCLUDED.commandtype",
+			quote_qualified_identifier(CRON_SCHEMA_NAME, LT_JOB_EXT), (long long int)jobid, jobname, userName, mode, tmzone, cmdtype);
 	}
 
 	GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
@@ -1282,21 +1346,21 @@ deleteCronExt(int64 jobid, char *jobname)
 	InvalidateJobCache();
 }
 
-/*
- * query mode from cron.lt_job_ext where == jobid
- */
-void
-queryModeFromCronExt(int64 jobid, char *mode)
+void 
+queryCommandFromJobRunDetail(int64 runid, char *value, unsigned int insize)
 {
 	StringInfoData querybuf;
 	MemoryContext originalContext = CurrentMemoryContext;
 	char *buf = NULL;
 
+	if (NULL == value)
+		elog(ERROR, "query filed is empty");
+
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
 
-	if (!PgCronHasBeenLoaded() || RecoveryInProgress() || !JobLtExtTableExists())
+	if (!PgCronHasBeenLoaded() || RecoveryInProgress() || !JobRunDetailsTableExists())
 	{
 		PopActiveSnapshot();
 		CommitTransactionCommand();
@@ -1312,8 +1376,8 @@ queryModeFromCronExt(int64 jobid, char *mode)
 		elog(ERROR, "SPI_connect failed");
 	}
 
-	appendStringInfo(&querybuf, "select mode from %s where jobid = %lld",
-			quote_qualified_identifier(CRON_SCHEMA_NAME, LT_JOB_EXT), (long long int)jobid);
+	appendStringInfo(&querybuf, "select command from %s where runid = %lld",
+			quote_qualified_identifier(CRON_SCHEMA_NAME, JOB_RUN_DETAILS_TABLE_NAME), (long long int)runid);
 
 	pgstat_report_activity(STATE_RUNNING, querybuf.data);
 
@@ -1325,9 +1389,9 @@ queryModeFromCronExt(int64 jobid, char *mode)
 	if (SPI_processed > 0)
 	{
 		buf = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-		if (NULL != mode && NULL != buf)
+		if (NULL != buf && insize > strlen(buf))
 		{
-			memcpy(mode, buf, strlen(buf));
+			memcpy(value, buf, strlen(buf));
 		}
 	}
 	pfree(querybuf.data);
@@ -1340,14 +1404,17 @@ queryModeFromCronExt(int64 jobid, char *mode)
 }
 
 /*
- * query timezone from cron.lt_job_ext where == jobid
+ * query filed to value from cron.lt_job_ext where == jobid
  */
 void
-queryZoneFromCronExt(int64 jobid, int *tmzone)
+queryFiledFromCron(int64 jobid, char *tablename, char *filed, char *value, unsigned int insize)
 {
 	StringInfoData querybuf;
 	MemoryContext originalContext = CurrentMemoryContext;
 	char *buf = NULL;
+
+	if (NULL == tablename || NULL == filed || NULL == value)
+		elog(ERROR, "query filed is empty");
 
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
@@ -1369,8 +1436,8 @@ queryZoneFromCronExt(int64 jobid, int *tmzone)
 		elog(ERROR, "SPI_connect failed");
 	}
 
-	appendStringInfo(&querybuf, "select timezone from %s where jobid = %lld",
-			quote_qualified_identifier(CRON_SCHEMA_NAME, LT_JOB_EXT), (long long int)jobid);
+	appendStringInfo(&querybuf, "select %s from %s where jobid = %lld", filed,
+			quote_qualified_identifier(CRON_SCHEMA_NAME, tablename), (long long int)jobid);
 
 	pgstat_report_activity(STATE_RUNNING, querybuf.data);
 
@@ -1382,9 +1449,9 @@ queryZoneFromCronExt(int64 jobid, int *tmzone)
 	if (SPI_processed > 0)
 	{
 		buf = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-		if (NULL != tmzone && NULL != buf)
+		if (NULL != buf && insize > strlen(buf))
 		{
-			(*tmzone) = atoi(buf);
+			memcpy(value, buf, strlen(buf));
 		}
 	}
 	pfree(querybuf.data);

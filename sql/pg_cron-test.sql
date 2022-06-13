@@ -1,6 +1,6 @@
 CREATE EXTENSION pg_cron VERSION '1.0';
 SELECT extversion FROM pg_extension WHERE extname='pg_cron';
-ALTER EXTENSION pg_cron UPDATE TO '1.4';
+ALTER EXTENSION pg_cron UPDATE TO '1.5';
 SELECT extversion FROM pg_extension WHERE extname='pg_cron';
 
 -- Vacuum every day at 10:00am (GMT)
@@ -87,5 +87,13 @@ SELECT jobid, jobname, schedule, command, mode FROM cron.lt_job ORDER BY jobid;
 SELECT cron.unschedule(9);
 
 SELECT jobid, jobname, schedule, command FROM cron.job ORDER BY jobid;
+
+SELECT cron.schedule('test1', '* * * * * *', 'select1', 'next', '8', 'sql');
+SELECT cron.schedule('test2', '* * * * * *', 'select2', 'asap', '8', 'sql');
+SELECT cron.schedule('test3', '* * * * * *', 'select3', 'single', '8', 'sql');
+SELECT cron.schedule('test4', '* * * * * *', 'select4', 'fixed', '8', 'sql');
+SELECT cron.schedule('test5', '* * * * * *', 'echo12345', 'next', '8', 'linux');
+SELECT jobid, jobname, schedule, command FROM cron.job ORDER BY jobid;
+SELECT pg_sleep(3);
 
 DROP EXTENSION pg_cron;

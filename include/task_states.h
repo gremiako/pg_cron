@@ -41,6 +41,12 @@ typedef enum
 	CRON_MODE_SINGLE = 3
 } CronModeState;
 
+typedef enum
+{
+	CRON_COMMAND_TYPE_SQL = 0,
+	CRON_COMMAND_TYPE_LINUX = 1,
+} CronCommandType;
+
 struct BackgroundWorkerHandle
 {
 	int slot;
@@ -63,6 +69,7 @@ typedef struct CronTask
 	dsm_segment *seg;
 	BackgroundWorkerHandle handle;
 	int mode;
+	int commandtype;
 } CronTask;
 
 typedef struct CronFixedTask
@@ -81,6 +88,7 @@ typedef struct CronFixedTask
 	dsm_segment *seg;
 	BackgroundWorkerHandle handle;
 	int mode;
+	int commandtype;
 } CronFixedTask;
 
 extern void InitializeTaskStateHash(void);

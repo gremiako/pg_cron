@@ -95,7 +95,7 @@ GetCronFixedTask(int64 runId, CronTask *task)
 	CronFixedTask *_curTask = NULL;
 	int64 hashKey = runId;
 	bool isPresent = false;
-	int offsetlen = sizeof(int64) * 2;
+	int offsetlen = 0;
 
 	_curTask = hash_search(CronFixedTaskHash, &hashKey, HASH_ENTER, &isPresent);
 	if (_curTask && !isPresent)
@@ -105,7 +105,8 @@ GetCronFixedTask(int64 runId, CronTask *task)
 			elog(INFO, "GetCronFixedTask task parameter is NULL");
 			return NULL;
 		}
-			
+		
+		offsetlen = sizeof(task->jobId) + sizeof(task->runId);
 		task->runId = runId;
 		_curTask->runId = task->runId;
 		_curTask->jobId = task->jobId;

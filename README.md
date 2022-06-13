@@ -25,7 +25,8 @@ SELECT cron.schedule('nightly-vacuum', '0 3 * * *', 'VACUUM');
 SELECT cron.unschedule('nightly-vacuum' );
  unschedule
 ------------
-          t
+ t
+(1 row)
 
 SELECT cron.unschedule(42);
  unschedule
@@ -67,19 +68,19 @@ pg_cron can support four task modes, include one-time tasks, asap takes, next in
    schedule
   ----------
          46
-  
+
   -- Change to Vacuum every 30 seconds
   SELECT cron.schedule('dayly-vacuum', '*/30 * * * * *', 'VACUUM', 'next');
    schedule
   ----------
          46
-  
+
   -- Change to Vacuum only once at the next 10:00:30am (East eight time zone)
   SELECT cron.schedule('dayly-vacuum', '30 0 10 * * *', 'VACUUM', 'single');
    schedule
   ----------
          46
-  
+
   -- Change to Vacuum every day at 10:00:30am (East eight time zone)
   SELECT cron.schedule('dayly-vacuum', '30 0 10 * * *', 'VACUUM', 'next');
    schedule
@@ -96,7 +97,7 @@ pg_cron can support four task modes, include one-time tasks, asap takes, next in
    schedule
   ----------
          46
-  
+
   -- Change to Vacuum every day at 10:00:30am (East eight time zone)
   SELECT cron.schedule('dayly-vacuum', '30 0 10 * * *', 'VACUUM', 'asap');
    schedule
@@ -115,7 +116,7 @@ pg_cron can support four task modes, include one-time tasks, asap takes, next in
    schedule
   ----------
          46
-  
+
   -- Change to Vacuum every day at 10:00:30am (East eight time zone)
   SELECT cron.schedule('dayly-vacuum', '30 0 10 * * *', 'VACUUM', 'next');
    schedule
@@ -134,7 +135,7 @@ pg_cron can support four task modes, include one-time tasks, asap takes, next in
    schedule
   ----------
          46
-  
+
   -- Change to Vacuum every day at 10:00:30am (East eight time zone)
   SELECT cron.schedule('dayly-vacuum', '30 0 10 * * *', 'VACUUM', 'fixed');
    schedule
@@ -166,9 +167,28 @@ SELECT cron.schedule('dayly-vacuum', '0 10 * * *', 'VACUUM', 'single', '6');
         
 ```
 
+pg_cron can support the execution of linux os commands. You can pass the command type value in the sixth parameter. pass parameter 'sql' represents that the second parameter is the sql command, and pass parameter 'linux' represents that the second parameter is the sql command. If you want to configure the command type, the first parameter task name, the fourth parameter task mode and the fifth parameter time zone must be passed in. If no command type is configured, the default is sql command. Note that you must be a super user to execute linux commands:
+
+```
+-- Change to Vacuum every day at 10:00am (East eight time zone)
+SELECT cron.schedule('dayly-vacuum', '0 10 * * *', 'VACUUM', 'next', '8', 'sql');
+ schedule
+----------
+       46
+
+-- delete log file every day at 23:59 (East eight time zone)
+SELECT cron.schedule('dayly-touch', '59 23 * * *', 'rm -rf $PGDATA/log/*', 'next', '8', 'linux');
+ schedule
+----------
+       46
+        
+```
+
 pg_cron can run multiple jobs in parallel, and by default it uses next interval mode, i.e. it runs at most one instance of a job at a time. If a second run is supposed to start before the first one finishes, then the second run is queued and started at the time point of the next timing cycle.
 
-pg_cron supports a 30-second timeout for scheduled tasks by default, which is valid for all types of tasks. If the task execution times out, it will log the error in `cron.job_run_details` and return, waiting for the next execution. You can modify the timing task timeout time by setting the guc parameter `cron.task_running_timeout` in postgresql.conf and restarting the database to take effect. The maximum value is 1800 seconds; if it is set to 0, it means there is no timeout limit.
+pg_cron supports a default timeout of 30 seconds for scheduled tasks for SQL commands, which is valid for all types of tasks. If the task execution times out, it will log the error in `cron.job_run_details` and return, waiting for the next execution. You can modify the timing task timeout time by setting the guc parameter `cron.task_running_timeout` in postgresql.conf and restarting the database to take effect. The maximum value is 1800 seconds; if it is set to 0, it means there is no timeout limit.
+
+Note that there is no timeout mechanism for linux command timing tasks.
 
 The schedule uses the standard cron syntax, in which * means "run every time period", and a specific number means "but only at this time":
 
@@ -206,10 +226,6 @@ It has been enhanced on the basis of standard cron syntax to supports second-lev
 For security, jobs are executed in the database in which the cron.schedule function is called with the same permissions as the current user. In addition, users are only able to see their own jobs in the `cron.job` table and `cron.lt_job` view.
 
 
-
 Test example：
 
 ![image-20220511203057950](./image-20220511203057950.png)
-
-
-

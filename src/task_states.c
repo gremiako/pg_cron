@@ -99,28 +99,27 @@ RefreshTaskHash(void)
 	foreach(jobCell, jobList)
 	{
 		CronJob *job = (CronJob *) lfirst(jobCell);
-		char mode[16] = {0};
+		char value[DEFAULT_FILED_LEN] = {0};
 
 		CronTask *task = GetCronTask(job->jobId);
 		task->isActive = job->active;
 
-		queryModeFromCronExt(task->jobId, mode);
-		if (!strcmp(mode, MODE_ASAP))
-		{
+		queryFiledFromCron(task->jobId, LT_JOB_EXT, "mode", value, DEFAULT_FILED_LEN);
+		if (!strcmp(value, MODE_ASAP))
 			task->mode = CRON_MODE_ASAP;
-		}
-		else if (!strcmp(mode, MODE_FIXED))
-		{
+		else if (!strcmp(value, MODE_FIXED))
 			task->mode = CRON_MODE_FIXED;
-		}
-		else if (!strcmp(mode, MODE_SINGLE))
-		{
+		else if (!strcmp(value, MODE_SINGLE))
 			task->mode = CRON_MODE_SINGLE;
-		}
 		else
-		{
 			task->mode = CRON_MODE_NEXT;
-		}
+
+		memset(value, 0, DEFAULT_FILED_LEN);
+		queryFiledFromCron(task->jobId, LT_JOB_EXT, "commandtype", value, DEFAULT_FILED_LEN);
+		if (!strcmp(value, COMMAND_LINUX))
+			task->commandtype = CRON_COMMAND_TYPE_LINUX;
+		else
+			task->commandtype = CRON_COMMAND_TYPE_SQL;
 	}
 
 	CronJobCacheValid = true;

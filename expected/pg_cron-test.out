@@ -5,11 +5,11 @@ SELECT extversion FROM pg_extension WHERE extname='pg_cron';
  1.0
 (1 row)
 
-ALTER EXTENSION pg_cron UPDATE TO '1.4';
+ALTER EXTENSION pg_cron UPDATE TO '1.5';
 SELECT extversion FROM pg_extension WHERE extname='pg_cron';
  extversion 
 ------------
- 1.4
+ 1.5
 (1 row)
 
 -- Vacuum every day at 10:00am (GMT)
@@ -230,6 +230,53 @@ SELECT jobid, jobname, schedule, command FROM cron.job ORDER BY jobid;
  jobid | jobname | schedule |            command             
 -------+---------+----------+--------------------------------
      2 |         | @restart | ALTER EXTENSION pg_cron UPDATE
+(1 row)
+
+SELECT cron.schedule('test1', '* * * * * *', 'select1', 'next', '8', 'sql');
+ schedule 
+----------
+       14
+(1 row)
+
+SELECT cron.schedule('test2', '* * * * * *', 'select2', 'asap', '8', 'sql');
+ schedule 
+----------
+       15
+(1 row)
+
+SELECT cron.schedule('test3', '* * * * * *', 'select3', 'single', '8', 'sql');
+ schedule 
+----------
+       16
+(1 row)
+
+SELECT cron.schedule('test4', '* * * * * *', 'select4', 'fixed', '8', 'sql');
+ schedule 
+----------
+       17
+(1 row)
+
+SELECT cron.schedule('test5', '* * * * * *', 'echo12345', 'next', '8', 'linux');
+ schedule 
+----------
+       18
+(1 row)
+
+SELECT jobid, jobname, schedule, command FROM cron.job ORDER BY jobid;
+ jobid | jobname |  schedule   |            command             
+-------+---------+-------------+--------------------------------
+     2 |         | @restart    | ALTER EXTENSION pg_cron UPDATE
+    14 | test1   | * * * * * * | select1
+    15 | test2   | * * * * * * | select2
+    16 | test3   | * * * * * * | select3
+    17 | test4   | * * * * * * | select4
+    18 | test5   | * * * * * * | echo12345
+(6 rows)
+
+SELECT pg_sleep(3);
+ pg_sleep 
+----------
+ 
 (1 row)
 
 DROP EXTENSION pg_cron;

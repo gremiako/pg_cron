@@ -1,11 +1,16 @@
 # src/test/modules/pg_cron/Makefile
 
 EXTENSION = pg_cron
-EXTVERSION = 1.4
+EXTVERSION = 1.5
 
 DATA_built = $(EXTENSION)--1.0.sql
 DATA = $(wildcard $(EXTENSION)--*--*.sql)
+
+REGRESS_OPTS = --temp-config $(top_srcdir)/contrib/pg_cron/pg_cron.conf
 REGRESS = pg_cron-test 
+# Disabled because these tests require "shared_preload_libraries=pg_cron",
+# which typical installcheck users do not have (e.g. buildfarm clients).
+NO_INSTALLCHECK = 1
 
 # compilation configuration
 MODULE_big = $(EXTENSION)

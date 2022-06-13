@@ -42,11 +42,20 @@ typedef struct CronJob
 	Name jobName;
 } CronJob;
 
+#define JOBS_TABLE_NAME "job"
+#define LT_JOB_EXT "lt_job_ext"
+
 #define MODE_SINGLE 	"single"
 #define MODE_TIMING 	"timing"
 #define MODE_ASAP 		"asap"
 #define MODE_NEXT 		"next"
 #define MODE_FIXED 		"fixed"
+
+#define COMMAND_SQL		"sql"
+#define COMMAND_LINUX	"linux"
+
+#define DEFAULT_FILED_LEN	16
+#define MAX_STRING_LEN		1024
 
 /* global settings */
 extern char *CronHost;
@@ -62,12 +71,13 @@ extern CronJob * GetCronJob(int64 jobId);
 extern void InsertJobRunDetail(int64 runId, int64 *jobId, char *database, char *username, char *command, char *status);
 extern void UpdateJobRunDetail(int64 runId, int32 *job_pid, char *status, char *return_message, TimestampTz *start_time,
 									TimestampTz *end_time);
+extern void queryCommandFromJobRunDetail(int64 runid, char *value, unsigned int insize);
+
 extern int64 NextRunId(void);
 extern void MarkPendingRunsAsFailed(void);
 extern char *GetCronStatus(CronStatus cronstatus);
 
-extern void queryModeFromCronExt(int64 jobid, char *mode);
-extern void queryZoneFromCronExt(int64 jobid, int *tmzone);
+extern void queryFiledFromCron(int64 jobid, char *tablename, char *filed, char *value, unsigned int insize);
 extern void updateCronActive(int64 jobid, char *active);
 extern void keepDataFromCronRun(void);
 
