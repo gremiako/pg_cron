@@ -2600,7 +2600,7 @@ CronBackgroundWorker(Datum main_arg)
 	/* Post-execution cleanup. */
 	disable_timeout(STATEMENT_TIMEOUT, false);
 	CommitTransactionCommand();
-	ProcessCompletedNotifies();
+	/*ProcessCompletedNotifies();*/
 	pgstat_report_activity(STATE_IDLE, command);
 	pgstat_report_stat(true);
 
