@@ -2716,7 +2716,9 @@ ExecuteSqlString(const char *sql)
 		 * perform internal transaction control.
 		 */
 		oldcontext = MemoryContextSwitchTo(parsecontext);
-		#if PG_VERSION_NUM >= 100000
+		#if PG_VERSION_NUM >= 150000
+			querytree_list = pg_analyze_and_rewrite_fixedparams(parsetree, sql, NULL, 0, NULL);
+    #elif PG_VERSION_NUM >= 100000
 			querytree_list = pg_analyze_and_rewrite(parsetree, sql, NULL, 0,NULL);
 		#else
 			querytree_list = pg_analyze_and_rewrite(parsetree, sql, NULL, 0);
